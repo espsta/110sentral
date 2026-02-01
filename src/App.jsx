@@ -6,7 +6,7 @@ import { supabase } from "./supabaseClient";
 const DEFAULT_CENTER = [59.9139, 10.7522];
 const DEFAULT_ZOOM = 10;
 
-// --- Felles “masterdata” som vi også speiler i DB ved session-start
+// --- Masterdata
 const stations = [
   { id: "T1", name: "T1 Lørenskog", lat: 59.9326, lng: 10.9650 },
   { id: "S1", name: "S1 Ski",      lat: 59.7195, lng: 10.8350 },
@@ -27,7 +27,7 @@ const resourcesMaster = [
   { id: "M14", callSign: "M14", type: "Tankbil",      stationId: "M1" },
 ];
 
-// ---------------------- UI ----------------------
+// ---------------------- UI THEME ----------------------
 const C = {
   bg: "#0b1220",
   panel: "#0f172a",
@@ -37,6 +37,8 @@ const C = {
   muted: "rgba(229,231,235,0.70)",
   accent: "#93c5fd",
   danger: "rgba(248,113,113,0.95)",
+  alarmBg: "rgba(220,38,38,0.18)",
+  alarmBorder: "rgba(248,113,113,0.55)",
 };
 
 function labelBoxHtml(text, tone = "normal") {
@@ -46,15 +48,15 @@ function labelBoxHtml(text, tone = "normal") {
       font-weight:900;
       font-size:12px;
       line-height:1.1;
-      color:${solved ? "rgba(229,231,235,0.75)" : "rgba(17,24,39,0.92)"};
-      background:${solved ? "rgba(245,245,245,0.95)" : "rgba(255,255,255,0.95)"};
-      border:1px solid rgba(0,0,0,0.12);
+      color:${solved ? "rgba(17,24,39,0.60)" : "rgba(17,24,39,0.92)"};
+      background:rgba(255,255,255,0.96);
+      border:1px solid rgba(0,0,0,0.14);
       border-radius:8px;
       padding:2px 6px;
       box-shadow:0 1px 6px rgba(0,0,0,0.25);
       margin-bottom:4px;
       white-space:nowrap;
-      max-width: 220px;
+      max-width: 240px;
       overflow:hidden;
       text-overflow:ellipsis;
     ">${text}</div>
@@ -123,6 +125,67 @@ function makeCode(len = 6) {
   return out;
 }
 
+function upsertById(prev, payload) {
+  const row = payload.new || payload.old;
+  if (!row) return prev;
+  if (payload.eventType === "DELETE") return prev.filter((x) => x.id !== row.id);
+  const idx = prev.findIndex((x) => x.id === row.id);
+  if (idx === -1) return [...prev, row];
+  const next = prev.slice();
+  next[idx] = row;
+  return next;
+}
+
+function upsertByKey(prev, payload, keys) {
+  const row = payload.new || payload.old;
+  if (!row) return prev;
+  const keyOf = (obj) => keys.map((k) => obj[k]).join("||");
+  if (payload.eventType === "DELETE") {
+    const k = keyOf(row);
+    return prev.filter((x) => keyOf(x) !== k);
+  }
+  const k = keyOf(row);
+  const idx = prev.findIndex((x) => keyOf(x) === k);
+  if (idx === -1) return [...prev, row];
+  const next = prev.slice();
+  next[idx] = row;
+  return next;
+}
+
+// Enkel alarmlyd uten fil (WebAudio)
+function playAlarmBeep() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const now = ctx.currentTime;
+
+    const o1 = ctx.createOscillator();
+    const g1 = ctx.createGain();
+    o1.type = "square";
+    o1.frequency.setValueAtTime(880, now);
+    g1.gain.setValueAtTime(0.0001, now);
+    g1.gain.exponentialRampToValueAtTime(0.25, now + 0.02);
+    g1.gain.exponentialRampToValueAtTime(0.0001, now + 0.25);
+    o1.connect(g1).connect(ctx.destination);
+    o1.start(now);
+    o1.stop(now + 0.26);
+
+    const o2 = ctx.createOscillator();
+    const g2 = ctx.createGain();
+    o2.type = "square";
+    o2.frequency.setValueAtTime(660, now + 0.30);
+    g2.gain.setValueAtTime(0.0001, now + 0.30);
+    g2.gain.exponentialRampToValueAtTime(0.25, now + 0.32);
+    g2.gain.exponentialRampToValueAtTime(0.0001, now + 0.55);
+    o2.connect(g2).connect(ctx.destination);
+    o2.start(now + 0.30);
+    o2.stop(now + 0.56);
+
+    setTimeout(() => ctx.close(), 900);
+  } catch {
+    // hvis audio ikke kan spilles (policy), ignorer
+  }
+}
+
 export default function App() {
   const mapDivRef = useRef(null);
   const mapRef = useRef(null);
@@ -133,26 +196,37 @@ export default function App() {
   const searchLayerRef = useRef(null);
 
   const [sessionId, setSessionId] = useState(null);
-  const [sessionCode, setSessionCode] = useState(getSessionCodeFromUrl() || "");
   const [statusMsg, setStatusMsg] = useState("Kobler til økt…");
 
-  // Delte data (fra DB)
-  const [resourceStates, setResourceStates] = useState([]); // rows from resource_states
-  const [incidents, setIncidents] = useState([]);          // rows from incidents
-  const [logs, setLogs] = useState([]);                    // rows from incident_logs
+  // Shared state
+  const [resourceStates, setResourceStates] = useState([]);
+  const [incidents, setIncidents] = useState([]);
+  const [logs, setLogs] = useState([]);
 
   // UI state
   const [selectedResourceId, setSelectedResourceId] = useState(null);
   const selectedResourceIdRef = useRef(null);
+
   const [incidentMode, setIncidentMode] = useState(false);
   const incidentModeRef = useRef(false);
 
-  // loggpanel
-  const [activeIncidentId, setActiveIncidentId] = useState(null);
+  // Kollaps
+  const [expandedStations, setExpandedStations] = useState(() => {
+    const obj = {};
+    stations.forEach((s) => (obj[s.id] = true));
+    return obj;
+  });
+  const [expandedIncidentId, setExpandedIncidentId] = useState(null);
+
+  // Logg input (gjelder hendelsen som er åpnet)
   const [author, setAuthor] = useState("");
   const [logText, setLogText] = useState("");
 
-  // søk
+  // Instruktør
+  const [isInstructor, setIsInstructor] = useState(() => localStorage.getItem("isInstructor") === "1");
+  const [abaSource, setAbaSource] = useState("");
+
+  // Search
   const [q, setQ] = useState("");
   const [searching, setSearching] = useState(false);
   const [results, setResults] = useState([]);
@@ -168,6 +242,23 @@ export default function App() {
     for (const k of Object.keys(grouped)) grouped[k].sort((a,b)=>a.callSign.localeCompare(b.callSign, "no"));
     return grouped;
   }, []);
+
+  const logsByIncident = useMemo(() => {
+    const m = new Map();
+    for (const l of logs) {
+      if (!m.has(l.incident_id)) m.set(l.incident_id, []);
+      m.get(l.incident_id).push(l);
+    }
+    return m;
+  }, [logs]);
+
+  // ABA-alarmer (deres “alarmfelt”)
+  const abaAlarms = useMemo(() => {
+    return incidents
+      .filter((x) => !x.solved && (x.title || "").trim().toUpperCase() === "ABA")
+      .slice()
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+  }, [incidents]);
 
   const panelStyle = {
     background: C.panel,
@@ -209,20 +300,16 @@ export default function App() {
         code = makeCode(6);
         setSessionCodeInUrl(code);
       }
-      setSessionCode(code);
 
-      // finn eller lag session
-      setStatusMsg("Finner/oppter økt…");
-      let { data: existing, error: e1 } = await supabase
+      setStatusMsg("Finner/oppretter økt…");
+
+      const { data: existing, error: e1 } = await supabase
         .from("sessions")
         .select("id, code")
         .eq("code", code)
         .maybeSingle();
 
-      if (e1) {
-        setStatusMsg("Feil ved oppslag av økt.");
-        return;
-      }
+      if (e1) { setStatusMsg("Feil ved oppslag av økt."); return; }
 
       let sid = existing?.id;
       if (!sid) {
@@ -231,17 +318,14 @@ export default function App() {
           .insert({ code })
           .select("id, code")
           .single();
-        if (e2) {
-          setStatusMsg("Feil ved opprettelse av økt.");
-          return;
-        }
+        if (e2) { setStatusMsg("Feil ved opprettelse av økt."); return; }
         sid = created.id;
       }
 
       setSessionId(sid);
       setStatusMsg(`Økt: ${code}`);
 
-      // Seed resource_states (upsert) slik at alle alltid har samme liste i DB
+      // Seed resource states
       const seed = resourcesMaster.map((r) => ({
         session_id: sid,
         resource_id: r.id,
@@ -254,7 +338,6 @@ export default function App() {
       }));
       await supabase.from("resource_states").upsert(seed, { onConflict: "session_id,resource_id" });
 
-      // initial fetch
       const [rs, inc, lg] = await Promise.all([
         supabase.from("resource_states").select("*").eq("session_id", sid),
         supabase.from("incidents").select("*").eq("session_id", sid).order("created_at", { ascending: true }),
@@ -265,77 +348,48 @@ export default function App() {
       if (!inc.error) setIncidents(inc.data || []);
       if (!lg.error) setLogs(lg.data || []);
 
-      // realtime subscriptions (filtered per session_id)
       const ch = supabase.channel(`session:${sid}`);
 
       ch.on(
         "postgres_changes",
         { event: "*", schema: "public", table: "resource_states", filter: `session_id=eq.${sid}` },
-        (payload) => {
-          setResourceStates((prev) => upsertByKey(prev, payload, ["session_id", "resource_id"]));
-        }
+        (payload) => setResourceStates((prev) => upsertByKey(prev, payload, ["session_id", "resource_id"]))
       );
-
       ch.on(
         "postgres_changes",
         { event: "*", schema: "public", table: "incidents", filter: `session_id=eq.${sid}` },
-        (payload) => {
-          setIncidents((prev) => upsertById(prev, payload));
-        }
+        (payload) => setIncidents((prev) => upsertById(prev, payload))
       );
-
       ch.on(
         "postgres_changes",
         { event: "*", schema: "public", table: "incident_logs", filter: `session_id=eq.${sid}` },
-        (payload) => {
-          setLogs((prev) => upsertById(prev, payload));
-        }
+        (payload) => setLogs((prev) => upsertById(prev, payload))
       );
 
       ch.subscribe();
-
-      return () => {
-        supabase.removeChannel(ch);
-      };
+      return () => { supabase.removeChannel(ch); };
     })();
   }, []);
 
-  // helpers for realtime merging
-  function upsertById(prev, payload) {
-    const row = payload.new || payload.old;
-    if (!row) return prev;
+  // Alarmlyd ved NY ABA
+  const seenIncidentIdsRef = useRef(new Set());
+  useEffect(() => {
+    const seen = seenIncidentIdsRef.current;
+    // finn nye incidents vi ikke har sett før
+    for (const it of incidents) {
+      if (!it?.id) continue;
+      if (seen.has(it.id)) continue;
 
-    if (payload.eventType === "DELETE") {
-      return prev.filter((x) => x.id !== row.id);
+      seen.add(it.id);
+
+      const isABA = (it.title || "").trim().toUpperCase() === "ABA";
+      if (isABA && !it.solved) {
+        playAlarmBeep();
+      }
     }
+  }, [incidents]);
 
-    const idx = prev.findIndex((x) => x.id === row.id);
-    if (idx === -1) return [...prev, row];
-    const next = prev.slice();
-    next[idx] = row;
-    return next;
-  }
-
-  function upsertByKey(prev, payload, keys) {
-    const row = payload.new || payload.old;
-    if (!row) return prev;
-
-    const keyOf = (obj) => keys.map((k) => obj[k]).join("||");
-
-    if (payload.eventType === "DELETE") {
-      const k = keyOf(row);
-      return prev.filter((x) => keyOf(x) !== k);
-    }
-
-    const k = keyOf(row);
-    const idx = prev.findIndex((x) => keyOf(x) === k);
-    if (idx === -1) return [...prev, row];
-    const next = prev.slice();
-    next[idx] = row;
-    return next;
-  }
-
-  // ---------------------- MAP INIT ----------------------
+  // ---------------------- MAP INIT (stations drawn once) ----------------------
   useEffect(() => {
     if (!mapDivRef.current) return;
     if (mapRef.current) return;
@@ -343,7 +397,6 @@ export default function App() {
     const map = L.map(mapDivRef.current, { center: DEFAULT_CENTER, zoom: DEFAULT_ZOOM });
     mapRef.current = map;
 
-    // LYST kart
     L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", {
       attribution: "&copy; OpenStreetMap-bidragsytere &copy; CARTO",
     }).addTo(map);
@@ -353,10 +406,17 @@ export default function App() {
     incidentLayerRef.current = L.layerGroup().addTo(map);
     searchLayerRef.current = L.layerGroup().addTo(map);
 
+    // Stasjoner: tegn én gang, aldri clear
+    stations.forEach((s) => {
+      L.marker([s.lat, s.lng], { icon: makeStationIcon(s.id), interactive: true, zIndexOffset: 2500 })
+        .bindPopup(`<b>${s.name}</b>`)
+        .addTo(stationLayerRef.current);
+    });
+
     map.on("click", async (e) => {
       if (!sessionId) return;
 
-      // 1) Opprett hendelse i DB
+      // Opprett hendelse (vanlig modus)
       if (incidentModeRef.current) {
         const title = window.prompt("Overskrift/hendelsestype (f.eks. 'Brann i bolig'):");
         if (!title || !title.trim()) return;
@@ -373,7 +433,7 @@ export default function App() {
         return;
       }
 
-      // 2) Plasser ressurs (DB upsert/update)
+      // Plasser ressurs
       const rid = selectedResourceIdRef.current;
       if (!rid) return;
 
@@ -397,7 +457,7 @@ export default function App() {
       setSelectedResourceId(null);
     });
 
-    setTimeout(() => map.invalidateSize(), 50);
+    setTimeout(() => map.invalidateSize(), 100);
     const onResize = () => map.invalidateSize();
     window.addEventListener("resize", onResize);
 
@@ -408,18 +468,7 @@ export default function App() {
     };
   }, [sessionId]);
 
-  // ---------------------- LAYERS RENDER ----------------------
-  useEffect(() => {
-    if (!stationLayerRef.current) return;
-    stationLayerRef.current.clearLayers();
-
-    stations.forEach((s) => {
-      L.marker([s.lat, s.lng], { icon: makeStationIcon(s.id), interactive: true })
-        .bindPopup(`<b>${s.name}</b>`)
-        .addTo(stationLayerRef.current);
-    });
-  }, []);
-
+  // ---------------------- LAYERS RENDER (resources/incidents only) ----------------------
   useEffect(() => {
     if (!resourceLayerRef.current) return;
     resourceLayerRef.current.clearLayers();
@@ -427,7 +476,7 @@ export default function App() {
     resourceStates
       .filter((x) => x.status === "DEPLOYED" && x.lat != null && x.lng != null)
       .forEach((r) => {
-        L.marker([r.lat, r.lng], { icon: makeFireTruckIcon(r.call_sign), interactive: true })
+        L.marker([r.lat, r.lng], { icon: makeFireTruckIcon(r.call_sign), interactive: true, zIndexOffset: 1800 })
           .bindPopup(`<b>${r.call_sign}</b><br/>${r.type}`)
           .addTo(resourceLayerRef.current);
       });
@@ -438,9 +487,12 @@ export default function App() {
     incidentLayerRef.current.clearLayers();
 
     incidents.forEach((h) => {
-      L.marker([h.lat, h.lng], { icon: makeIncidentIcon(h.title, h.solved), interactive: true })
-        .on("click", () => setActiveIncidentId(h.id))
-        .bindPopup(`<b>${h.title}</b><br/>Status: ${h.solved ? "Løst" : "Aktiv"}`)
+      const title = (h.title || "").trim().toUpperCase() === "ABA"
+        ? `ABA${h.source ? ` – ${h.source}` : ""}`
+        : h.title;
+
+      L.marker([h.lat, h.lng], { icon: makeIncidentIcon(title, h.solved), interactive: true, zIndexOffset: 2000 })
+        .bindPopup(`<b>${title}</b><br/>Status: ${h.solved ? "Løst" : "Aktiv"}`)
         .addTo(incidentLayerRef.current);
     });
   }, [incidents]);
@@ -448,11 +500,11 @@ export default function App() {
   // ---------------------- ACTIONS ----------------------
   const returnToStation = async (resourceId) => {
     if (!sessionId) return;
-    await supabase.from("resource_states").update({
-      status: "ON_STATION",
-      lat: null,
-      lng: null,
-    }).eq("session_id", sessionId).eq("resource_id", resourceId);
+    await supabase
+      .from("resource_states")
+      .update({ status: "ON_STATION", lat: null, lng: null })
+      .eq("session_id", sessionId)
+      .eq("resource_id", resourceId);
 
     setSelectedResourceId(null);
   };
@@ -462,14 +514,14 @@ export default function App() {
     await supabase.from("incidents").update({ solved: true }).eq("id", incidentId).eq("session_id", sessionId);
   };
 
-  const sendLog = async () => {
-    if (!sessionId || !activeIncidentId) return;
+  const sendLog = async (incidentId) => {
+    if (!sessionId || !incidentId) return;
     const msg = logText.trim();
     if (!msg) return;
 
     await supabase.from("incident_logs").insert({
       session_id: sessionId,
-      incident_id: activeIncidentId,
+      incident_id: incidentId,
       author: author.trim() || null,
       message: msg,
     });
@@ -477,14 +529,53 @@ export default function App() {
     setLogText("");
   };
 
-  const activeIncident = incidents.find((x) => x.id === activeIncidentId) || null;
-  const activeLogs = logs.filter((l) => l.incident_id === activeIncidentId);
+  const requireInstructor = () => {
+    if (isInstructor) return true;
+    const pin = window.prompt("Instruktør-PIN:");
+    if (!pin) return false;
+    setIsInstructor(true);
+    localStorage.setItem("isInstructor", "1");
+    return true;
+  };
 
-  // ---------------------- SEARCH (Nominatim) ----------------------
+  const randomPointInEastBox = () => {
+    const minLat = 59.20, maxLat = 60.20;
+    const minLng = 10.10, maxLng = 11.50;
+    return {
+      lat: minLat + Math.random() * (maxLat - minLat),
+      lng: minLng + Math.random() * (maxLng - minLng),
+    };
+  };
+
+  const generateABA = async () => {
+    if (!sessionId) return;
+    if (!requireInstructor()) return;
+
+    const src = abaSource.trim();
+    if (!src) {
+      alert("Instruktør: fyll inn hvor alarmen kommer fra (kilde).");
+      return;
+    }
+
+    const { lat, lng } = randomPointInEastBox();
+
+    await supabase.from("incidents").insert({
+      session_id: sessionId,
+      title: "ABA",
+      source: src,
+      lat,
+      lng,
+      solved: false,
+    });
+
+    zoomTo(lat, lng, 13);
+    setExpandedIncidentId(null);
+  };
+
+  // ---------------------- SEARCH ----------------------
   const runSearch = async () => {
     const raw = q.trim();
     if (!raw) return;
-
     const query = /norge|norway/i.test(raw) ? raw : `${raw}, Norge`;
 
     setSearching(true);
@@ -492,21 +583,15 @@ export default function App() {
     setResults([]);
 
     try {
-      // Grov avgrensning til “Øst-ish”
       const viewbox = "10.0,59.0,11.8,60.3";
-
       const url =
         "https://nominatim.openstreetmap.org/search" +
-        "?format=jsonv2" +
-        "&limit=10" +
-        "&addressdetails=1" +
-        "&countrycodes=no" +
+        "?format=jsonv2&limit=10&addressdetails=1&countrycodes=no" +
         "&viewbox=" + encodeURIComponent(viewbox) +
-        "&bounded=1" +
-        "&q=" + encodeURIComponent(query);
+        "&bounded=1&q=" + encodeURIComponent(query);
 
       const res = await fetch(url, { headers: { Accept: "application/json", "Accept-Language": "no" } });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) throw new Error();
 
       const data = await res.json();
       const cleaned = (data || []).filter((x) => x.lat && x.lon).map((x) => ({
@@ -516,12 +601,7 @@ export default function App() {
       }));
 
       setResults(cleaned);
-
-      if (cleaned.length > 0) {
-        pickResult(cleaned[0]);
-      } else {
-        setSearchError("Fant ingen treff. Prøv: 'Gatenavn nummer, sted' (f.eks. 'Storgata 10, Ski').");
-      }
+      if (cleaned.length === 0) setSearchError("Fant ingen treff. Prøv: 'Gatenavn nummer, sted' (f.eks. 'Storgata 10, Ski').");
     } catch {
       setSearchError("Søk feilet (nett/proxy eller rate limit).");
     } finally {
@@ -534,13 +614,8 @@ export default function App() {
     zoomTo(r.lat, r.lon, 15);
     if (searchLayerRef.current) {
       searchLayerRef.current.clearLayers();
-      L.circleMarker([r.lat, r.lon], {
-        radius: 8,
-        weight: 2,
-        color: C.accent,
-        fillColor: C.accent,
-        fillOpacity: 0.2,
-      }).addTo(searchLayerRef.current);
+      L.circleMarker([r.lat, r.lon], { radius: 8, weight: 2, color: C.accent, fillColor: C.accent, fillOpacity: 0.2 })
+        .addTo(searchLayerRef.current);
     }
   };
 
@@ -549,7 +624,7 @@ export default function App() {
     <div style={{
       height: "100vh",
       display: "grid",
-      gridTemplateColumns: "380px 1fr 460px",
+      gridTemplateColumns: "380px 1fr 520px",
       gap: 12,
       padding: 12,
       background: C.bg,
@@ -560,10 +635,7 @@ export default function App() {
         <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", gap:8 }}>
           <div style={{ fontWeight:900, fontSize:16 }}>Brannressurser</div>
           <button
-            onClick={() => {
-              setSelectedResourceId(null);
-              setIncidentMode(v => !v);
-            }}
+            onClick={() => { setSelectedResourceId(null); setIncidentMode(v => !v); }}
             style={buttonStyle(incidentMode)}
           >
             Ny hendelse
@@ -571,74 +643,93 @@ export default function App() {
         </div>
 
         <div style={{ marginTop: 8, fontSize: 12, color: C.muted }}>
-          {statusMsg} • Del lenken: <b style={{ color: C.text }}>{window.location.href}</b>
-        </div>
-
-        <div style={{ marginTop: 8, fontSize: 12, color: C.muted }}>
-          {incidentMode ? "Hendelsemodus: klikk i kartet for å opprette." : "Klikk ressurs → klikk i kartet for å plassere."}
+          {statusMsg} • Del lenken med andre for samme økt.
         </div>
 
         <div style={{ marginTop: 12, display:"flex", flexDirection:"column", gap:12 }}>
-          {stations.map((s) => (
-            <div key={s.id} style={cardStyle}>
-              <div style={{ fontWeight: 900, marginBottom: 8 }}>{s.name}</div>
+          {stations.map((s) => {
+            const isOpen = !!expandedStations[s.id];
+            return (
+              <div key={s.id} style={cardStyle}>
+                <button
+                  onClick={() => setExpandedStations(prev => ({ ...prev, [s.id]: !prev[s.id] }))}
+                  style={{
+                    width: "100%",
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    border: "none",
+                    background: "transparent",
+                    color: C.text,
+                    cursor: "pointer",
+                    padding: 0,
+                    fontWeight: 900,
+                  }}
+                  title="Kollaps/utvid"
+                >
+                  <span>{s.name}</span>
+                  <span style={{ color: C.muted, fontWeight: 900 }}>{isOpen ? "▾" : "▸"}</span>
+                </button>
 
-              <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
-                {(resourcesByStation[s.id] || []).map((r) => {
-                  const state = resourceStates.find((x) => x.resource_id === r.id);
-                  const isPlaced = state?.status === "DEPLOYED";
-                  const isSelected = selectedResourceId === r.id;
+                {isOpen && (
+                  <div style={{ marginTop: 10, display:"flex", flexDirection:"column", gap:8 }}>
+                    {(resourcesByStation[s.id] || []).map((r) => {
+                      const state = resourceStates.find((x) => x.resource_id === r.id);
+                      const isPlaced = state?.status === "DEPLOYED";
+                      const isSelected = selectedResourceId === r.id;
 
-                  return (
-                    <div key={r.id} style={{ display:"flex", gap:8, alignItems:"stretch" }}>
-                      <button
-                        onClick={() => {
-                          setIncidentMode(false);
-                          setSelectedResourceId(isSelected ? null : r.id);
-                        }}
-                        style={{
-                          flex: 1,
-                          textAlign: "left",
-                          borderRadius: 12,
-                          padding: 10,
-                          border: `1px solid ${C.border}`,
-                          background: isSelected ? "rgba(147,197,253,0.12)" : "rgba(255,255,255,0.03)",
-                          color: C.text,
-                          cursor: "pointer",
-                        }}
-                      >
-                        <div style={{ fontWeight: 900 }}>
-                          {r.callSign}{" "}
-                          <span style={{ fontWeight: 700, color: C.muted, fontSize: 12 }}>({r.type})</span>
+                      return (
+                        <div key={r.id} style={{ display:"flex", gap:8, alignItems:"stretch" }}>
+                          <button
+                            onClick={() => {
+                              setIncidentMode(false);
+                              setSelectedResourceId(isSelected ? null : r.id);
+                            }}
+                            style={{
+                              flex: 1,
+                              textAlign: "left",
+                              borderRadius: 12,
+                              padding: 10,
+                              border: `1px solid ${C.border}`,
+                              background: isSelected ? "rgba(147,197,253,0.12)" : "rgba(255,255,255,0.03)",
+                              color: C.text,
+                              cursor: "pointer",
+                            }}
+                          >
+                            <div style={{ fontWeight: 900 }}>
+                              {r.callSign}{" "}
+                              <span style={{ fontWeight: 700, color: C.muted, fontSize: 12 }}>({r.type})</span>
+                            </div>
+                            <div style={{ fontSize: 12, color: C.muted }}>
+                              {isPlaced ? "Status: Ute / plassert" : "Status: På stasjon"}
+                            </div>
+                          </button>
+
+                          {isPlaced && (
+                            <button
+                              onClick={() => returnToStation(r.id)}
+                              title="Tilbake til stasjon"
+                              style={{
+                                width: 52,
+                                borderRadius: 12,
+                                border: `1px solid ${C.border}`,
+                                background: "rgba(255,255,255,0.03)",
+                                color: C.text,
+                                cursor: "pointer",
+                                fontWeight: 900,
+                              }}
+                            >
+                              ↩
+                            </button>
+                          )}
                         </div>
-                        <div style={{ fontSize: 12, color: C.muted }}>
-                          {isPlaced ? "Status: Ute / plassert" : "Status: På stasjon"}
-                        </div>
-                      </button>
-
-                      {isPlaced && (
-                        <button
-                          onClick={() => returnToStation(r.id)}
-                          title="Tilbake til stasjon"
-                          style={{
-                            width: 52,
-                            borderRadius: 12,
-                            border: `1px solid ${C.border}`,
-                            background: "rgba(255,255,255,0.03)",
-                            color: C.text,
-                            cursor: "pointer",
-                            fontWeight: 900,
-                          }}
-                        >
-                          ↩
-                        </button>
-                      )}
-                    </div>
-                  );
-                })}
+                      );
+                    })}
+                  </div>
+                )}
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
 
@@ -754,118 +845,252 @@ export default function App() {
         <div ref={mapDivRef} style={{ height: "100%", width: "100%" }} />
       </div>
 
-      {/* RIGHT: INCIDENTS + LOG */}
-      <div style={panelStyle}>
-        <div style={{ fontWeight: 900, fontSize: 16 }}>Hendelser</div>
-        <div style={{ marginTop: 8, fontSize: 12, color: C.muted }}>
-          Klikk en hendelse for å se logg. Alt synkes i sanntid.
-        </div>
-
-        <div style={{ marginTop: 12, display:"flex", flexDirection:"column", gap:10 }}>
-          {incidents.length === 0 ? (
-            <div style={{ fontSize: 12, color: C.muted }}>Ingen hendelser opprettet.</div>
-          ) : (
-            incidents.slice().reverse().map((h) => (
-              <div key={h.id} style={{
-                border: `1px solid ${C.border}`,
-                borderRadius: 12,
-                padding: 10,
-                background: activeIncidentId === h.id ? "rgba(147,197,253,0.10)" : "rgba(255,255,255,0.03)",
-                cursor: "pointer",
+      {/* RIGHT: INCIDENTS + LOGG + ABA ALARMS */}
+      <div style={{ ...panelStyle, display: "flex", flexDirection: "column", gap: 12 }}>
+        {/* Instruktørpanel */}
+        <div style={cardStyle}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+            <div style={{ fontWeight: 900 }}>Instruktør</div>
+            <button
+              style={buttonStyle(isInstructor)}
+              onClick={() => {
+                if (isInstructor) {
+                  setIsInstructor(false);
+                  localStorage.removeItem("isInstructor");
+                } else {
+                  const ok = requireInstructor();
+                  if (!ok) return;
+                }
               }}
-              onClick={() => { setActiveIncidentId(h.id); zoomTo(h.lat, h.lng, 13); }}
-              >
-                <div style={{ fontWeight: 900 }}>
-                  {h.title}{" "}
-                  <span style={{ fontWeight: 800, color: C.muted, fontSize: 12 }}>
-                    ({String(h.id).slice(0, 8)})
-                  </span>
-                </div>
+            >
+              {isInstructor ? "Aktiv" : "Aktiver"}
+            </button>
+          </div>
 
-                <div style={{ marginTop: 4, fontSize: 12, color: C.muted }}>
-                  Status: {h.solved ? "Løst" : "Aktiv"}
-                </div>
-
-                <div style={{ marginTop: 10, display:"flex", gap:8, flexWrap:"wrap" }}>
-                  {!h.solved && (
-                    <button onClick={(e) => { e.stopPropagation(); markIncidentSolved(h.id); }} style={buttonStyle(false)}>
-                      Løst
-                    </button>
-                  )}
-                </div>
-              </div>
-            ))
-          )}
-        </div>
-
-        {/* Logg */}
-        <div style={{ marginTop: 14, borderTop: `1px solid ${C.border}`, paddingTop: 12 }}>
-          <div style={{ fontWeight: 900, marginBottom: 8 }}>Logg</div>
-
-          {!activeIncident ? (
-            <div style={{ fontSize: 12, color: C.muted }}>Velg en hendelse for å loggføre.</div>
-          ) : (
-            <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+          {isInstructor && (
+            <div style={{ marginTop: 10, display:"flex", flexDirection:"column", gap: 8 }}>
+              <input
+                value={abaSource}
+                onChange={(e) => setAbaSource(e.target.value)}
+                placeholder="ABA fra (f.eks. 'Rema 1000 Ski', 'Skole - sone 3')"
+                style={{
+                  width: "100%",
+                  borderRadius: 12,
+                  border: `1px solid ${C.border}`,
+                  background: "rgba(255,255,255,0.03)",
+                  color: C.text,
+                  padding: "10px 12px",
+                  outline: "none",
+                }}
+              />
+              <button onClick={generateABA} style={buttonStyle(false)}>
+                Generer ABA-alarm
+              </button>
               <div style={{ fontSize: 12, color: C.muted }}>
-                Hendelse: <b style={{ color: C.text }}>{activeIncident.title}</b>
-              </div>
-
-              <div style={{
-                maxHeight: 220,
-                overflow: "auto",
-                border: `1px solid ${C.border}`,
-                borderRadius: 12,
-                padding: 10,
-                background: "rgba(255,255,255,0.02)",
-              }}>
-                {activeLogs.length === 0 ? (
-                  <div style={{ fontSize: 12, color: C.muted }}>Ingen logginnslag.</div>
-                ) : (
-                  activeLogs.map((l) => (
-                    <div key={l.id} style={{ marginBottom: 10 }}>
-                      <div style={{ fontSize: 12, color: C.muted }}>
-                        {l.author ? `<${l.author}>` : ""} {new Date(l.created_at).toLocaleString("no-NO")}
-                      </div>
-                      <div style={{ color: C.text, fontWeight: 700 }}>{l.message}</div>
-                    </div>
-                  ))
-                )}
-              </div>
-
-              <div style={{ display:"flex", gap:8 }}>
-                <input
-                  value={author}
-                  onChange={(e) => setAuthor(e.target.value)}
-                  placeholder="Navn (valgfritt)"
-                  style={{
-                    width: 160,
-                    borderRadius: 12,
-                    border: `1px solid ${C.border}`,
-                    background: "rgba(255,255,255,0.03)",
-                    color: C.text,
-                    padding: "10px 12px",
-                    outline: "none",
-                  }}
-                />
-                <input
-                  value={logText}
-                  onChange={(e) => setLogText(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === "Enter") sendLog(); }}
-                  placeholder="Skriv logg…"
-                  style={{
-                    flex: 1,
-                    borderRadius: 12,
-                    border: `1px solid ${C.border}`,
-                    background: "rgba(255,255,255,0.03)",
-                    color: C.text,
-                    padding: "10px 12px",
-                    outline: "none",
-                  }}
-                />
-                <button onClick={sendLog} style={buttonStyle(false)}>Send</button>
+                Alarm går til alle i samme økt (og spiller lyd).
               </div>
             </div>
           )}
+        </div>
+
+        {/* Hendelser (accordion) */}
+        <div style={{ flex: 1, overflow: "auto" }}>
+          <div style={{ fontWeight: 900, fontSize: 16 }}>Hendelser</div>
+          <div style={{ marginTop: 8, fontSize: 12, color: C.muted }}>
+            Klikk en hendelse for å åpne/lukke logg.
+          </div>
+
+          <div style={{ marginTop: 12, display:"flex", flexDirection:"column", gap:10 }}>
+            {incidents.length === 0 ? (
+              <div style={{ fontSize: 12, color: C.muted }}>Ingen hendelser opprettet.</div>
+            ) : (
+              incidents.slice().reverse().map((h) => {
+                const isOpen = expandedIncidentId === h.id;
+                const hLogs = logsByIncident.get(h.id) || [];
+                const isABA = (h.title || "").trim().toUpperCase() === "ABA";
+                const headerTitle = isABA ? `ABA${h.source ? ` – ${h.source}` : ""}` : h.title;
+
+                return (
+                  <div key={h.id} style={{
+                    border: `1px solid ${C.border}`,
+                    borderRadius: 12,
+                    background: isOpen ? "rgba(147,197,253,0.10)" : "rgba(255,255,255,0.03)",
+                    overflow: "hidden",
+                  }}>
+                    <button
+                      onClick={() => { setExpandedIncidentId(prev => (prev === h.id ? null : h.id)); zoomTo(h.lat, h.lng, 13); }}
+                      style={{
+                        width: "100%",
+                        textAlign: "left",
+                        padding: 10,
+                        border: "none",
+                        background: "transparent",
+                        color: C.text,
+                        cursor: "pointer",
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        gap: 8,
+                      }}
+                      title="Kollaps/utvid"
+                    >
+                      <div>
+                        <div style={{ fontWeight: 900 }}>
+                          {headerTitle}{" "}
+                          <span style={{ fontWeight: 800, color: C.muted, fontSize: 12 }}>
+                            ({String(h.id).slice(0, 8)})
+                          </span>
+                        </div>
+                        <div style={{ marginTop: 4, fontSize: 12, color: C.muted }}>
+                          Status: {h.solved ? "Løst" : "Aktiv"}
+                        </div>
+                      </div>
+                      <div style={{ color: C.muted, fontWeight: 900 }}>{isOpen ? "▾" : "▸"}</div>
+                    </button>
+
+                    {isOpen && (
+                      <div style={{ padding: 10, borderTop: `1px solid ${C.border}` }}>
+                        <div style={{ display:"flex", gap:8, flexWrap:"wrap", marginBottom: 10 }}>
+                          {!h.solved && (
+                            <button onClick={() => markIncidentSolved(h.id)} style={buttonStyle(false)}>
+                              Løst
+                            </button>
+                          )}
+                          <button onClick={() => zoomTo(h.lat, h.lng, 15)} style={buttonStyle(false)}>
+                            Zoom
+                          </button>
+                        </div>
+
+                        <div style={{
+                          maxHeight: 200,
+                          overflow: "auto",
+                          border: `1px solid ${C.border}`,
+                          borderRadius: 12,
+                          padding: 10,
+                          background: "rgba(255,255,255,0.02)",
+                        }}>
+                          {hLogs.length === 0 ? (
+                            <div style={{ fontSize: 12, color: C.muted }}>Ingen logginnslag.</div>
+                          ) : (
+                            hLogs.map((l) => (
+                              <div key={l.id} style={{ marginBottom: 10 }}>
+                                <div style={{ fontSize: 12, color: C.muted }}>
+                                  {(l.author ? `<${l.author}> ` : "")}{new Date(l.created_at).toLocaleString("no-NO")}
+                                </div>
+                                <div style={{ color: C.text, fontWeight: 700 }}>{l.message}</div>
+                              </div>
+                            ))
+                          )}
+                        </div>
+
+                        <div style={{ display:"flex", gap:8, marginTop: 10 }}>
+                          <input
+                            value={author}
+                            onChange={(e) => setAuthor(e.target.value)}
+                            placeholder="Navn (valgfritt)"
+                            style={{
+                              width: 160,
+                              borderRadius: 12,
+                              border: `1px solid ${C.border}`,
+                              background: "rgba(255,255,255,0.03)",
+                              color: C.text,
+                              padding: "10px 12px",
+                              outline: "none",
+                            }}
+                          />
+                          <input
+                            value={logText}
+                            onChange={(e) => setLogText(e.target.value)}
+                            onKeyDown={(e) => { if (e.key === "Enter") sendLog(h.id); }}
+                            placeholder="Skriv logg…"
+                            style={{
+                              flex: 1,
+                              borderRadius: 12,
+                              border: `1px solid ${C.border}`,
+                              background: "rgba(255,255,255,0.03)",
+                              color: C.text,
+                              padding: "10px 12px",
+                              outline: "none",
+                            }}
+                          />
+                          <button onClick={() => sendLog(h.id)} style={buttonStyle(false)}>Send</button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+
+        {/* ABA alarmfelt nederst til høyre */}
+        <div style={{
+          borderRadius: 14,
+          border: `1px solid ${C.alarmBorder}`,
+          background: C.alarmBg,
+          padding: 10,
+        }}>
+          <div style={{ fontWeight: 900, color: "rgba(248,113,113,0.95)" }}>
+            ABA-alarmer
+          </div>
+          <div style={{ marginTop: 6, maxHeight: 160, overflow: "auto" }}>
+            {abaAlarms.length === 0 ? (
+              <div style={{ fontSize: 12, color: C.muted }}>Ingen aktive ABA-alarmer.</div>
+            ) : (
+              abaAlarms.map((a) => (
+                <div key={a.id} style={{
+                  borderRadius: 12,
+                  border: `1px solid rgba(248,113,113,0.30)`,
+                  background: "rgba(220,38,38,0.12)",
+                  padding: 10,
+                  marginBottom: 8,
+                }}>
+                  <div style={{ fontWeight: 900, color: "rgba(255,255,255,0.95)" }}>
+                    ABA – {a.source || "(ukjent kilde)"}
+                  </div>
+                  <div style={{ marginTop: 4, fontSize: 12, color: "rgba(229,231,235,0.85)" }}>
+                    {new Date(a.created_at).toLocaleString("no-NO")}
+                  </div>
+                  <div style={{ marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <button
+                      onClick={() => zoomTo(a.lat, a.lng, 14)}
+                      style={{
+                        border: `1px solid rgba(248,113,113,0.45)`,
+                        background: "rgba(0,0,0,0.15)",
+                        color: C.text,
+                        borderRadius: 10,
+                        padding: "6px 10px",
+                        cursor: "pointer",
+                        fontWeight: 900,
+                        fontSize: 12,
+                      }}
+                    >
+                      Zoom
+                    </button>
+                    <button
+                      onClick={() => markIncidentSolved(a.id)}
+                      style={{
+                        border: `1px solid rgba(248,113,113,0.45)`,
+                        background: "rgba(0,0,0,0.15)",
+                        color: C.text,
+                        borderRadius: 10,
+                        padding: "6px 10px",
+                        cursor: "pointer",
+                        fontWeight: 900,
+                        fontSize: 12,
+                      }}
+                    >
+                      Kvitter / løst
+                    </button>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+          <div style={{ marginTop: 6, fontSize: 12, color: "rgba(229,231,235,0.80)" }}>
+            (Lyd trigges ved ny ABA i økta.)
+          </div>
         </div>
       </div>
     </div>
