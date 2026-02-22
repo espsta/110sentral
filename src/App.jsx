@@ -27,7 +27,6 @@ const resourcesMaster = [
   { id: "M14", callSign: "M14", type: "Tankbil",      stationId: "M1" },
 ];
 
-// ---------------------- UI THEME ----------------------
 const C = {
   bg: "#0b1220",
   panel: "#0f172a",
@@ -56,7 +55,7 @@ function labelBoxHtml(text, tone = "normal") {
       box-shadow:0 1px 6px rgba(0,0,0,0.25);
       margin-bottom:4px;
       white-space:nowrap;
-      max-width: 240px;
+      max-width: 260px;
       overflow:hidden;
       text-overflow:ellipsis;
     ">${text}</div>
@@ -111,13 +110,11 @@ function getSessionCodeFromUrl() {
   const url = new URL(window.location.href);
   return url.searchParams.get("session");
 }
-
 function setSessionCodeInUrl(code) {
   const url = new URL(window.location.href);
   url.searchParams.set("session", code);
   window.history.replaceState({}, "", url.toString());
 }
-
 function makeCode(len = 6) {
   const chars = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
   let out = "";
@@ -135,7 +132,6 @@ function upsertById(prev, payload) {
   next[idx] = row;
   return next;
 }
-
 function upsertByKey(prev, payload, keys) {
   const row = payload.new || payload.old;
   if (!row) return prev;
@@ -152,7 +148,7 @@ function upsertByKey(prev, payload, keys) {
   return next;
 }
 
-// Enkel alarmlyd uten fil (WebAudio)
+// WebAudio alarm-beep
 function playAlarmBeep() {
   try {
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -181,9 +177,61 @@ function playAlarmBeep() {
     o2.stop(now + 0.56);
 
     setTimeout(() => ctx.close(), 900);
-  } catch {
-    // hvis audio ikke kan spilles (policy), ignorer
+  } catch {}
+}
+
+// ===== Routing (OSRM) + shared movement =====
+async function fetchRouteOSRM(fromLat, fromLng, toLat, toLng) {
+  const url =
+    `https://router.project-osrm.org/route/v1/driving/` +
+    `${fromLng},${fromLat};${toLng},${toLat}` +
+    `?overview=full&geometries=geojson&alternatives=false&steps=false`;
+
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("OSRM route failed");
+  const data = await res.json();
+
+  const coords = data?.routes?.[0]?.geometry?.coordinates; // [lng,lat]
+  if (!coords || coords.length < 2) throw new Error("No route geometry");
+  return coords.map(([lng, lat]) => [lat, lng]); // [lat,lng]
+}
+
+function haversineMeters(a, b) {
+  const R = 6371000;
+  const toRad = (x) => (x * Math.PI) / 180;
+  const dLat = toRad(b[0] - a[0]);
+  const dLng = toRad(b[1] - a[1]);
+  const lat1 = toRad(a[0]), lat2 = toRad(b[0]);
+  const s =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(s));
+}
+
+function buildDistances(points) {
+  const d = [0];
+  for (let i = 1; i < points.length; i++) {
+    d.push(d[i - 1] + haversineMeters(points[i - 1], points[i]));
   }
+  return d;
+}
+
+function interpolateOnLine(points, cumDist, dist) {
+  if (dist <= 0) return points[0];
+  const total = cumDist[cumDist.length - 1];
+  if (dist >= total) return points[points.length - 1];
+
+  let i = 1;
+  while (i < cumDist.length && cumDist[i] < dist) i++;
+  const d0 = cumDist[i - 1], d1 = cumDist[i];
+  const t = (dist - d0) / (d1 - d0);
+  const p0 = points[i - 1], p1 = points[i];
+  return [p0[0] + (p1[0] - p0[0]) * t, p0[1] + (p1[1] - p0[1]) * t];
+}
+
+function parseTs(ts) {
+  const t = Date.parse(ts);
+  return Number.isFinite(t) ? t : null;
 }
 
 export default function App() {
@@ -195,22 +243,28 @@ export default function App() {
   const incidentLayerRef = useRef(null);
   const searchLayerRef = useRef(null);
 
+  // Marker refs for resources (so we can animate)
+  const resourceMarkersRef = useRef(new Map()); // resource_id -> Leaflet Marker
+
+  // Route cache for movements (keyed by resource_id + move_started_at + dest)
+  const routeCacheRef = useRef(new Map()); // key -> { line, cum, total }
+
+  // active animation handles
+  const animHandleRef = useRef(null);
+
   const [sessionId, setSessionId] = useState(null);
   const [statusMsg, setStatusMsg] = useState("Kobler til økt…");
 
-  // Shared state
   const [resourceStates, setResourceStates] = useState([]);
   const [incidents, setIncidents] = useState([]);
   const [logs, setLogs] = useState([]);
 
-  // UI state
   const [selectedResourceId, setSelectedResourceId] = useState(null);
   const selectedResourceIdRef = useRef(null);
 
   const [incidentMode, setIncidentMode] = useState(false);
   const incidentModeRef = useRef(false);
 
-  // Kollaps
   const [expandedStations, setExpandedStations] = useState(() => {
     const obj = {};
     stations.forEach((s) => (obj[s.id] = true));
@@ -218,11 +272,10 @@ export default function App() {
   });
   const [expandedIncidentId, setExpandedIncidentId] = useState(null);
 
-  // Logg input (gjelder hendelsen som er åpnet)
   const [author, setAuthor] = useState("");
   const [logText, setLogText] = useState("");
 
-  // Instruktør
+  // Instruktør / ABA
   const [isInstructor, setIsInstructor] = useState(() => localStorage.getItem("isInstructor") === "1");
   const [abaSource, setAbaSource] = useState("");
 
@@ -252,7 +305,6 @@ export default function App() {
     return m;
   }, [logs]);
 
-  // ABA-alarmer (deres “alarmfelt”)
   const abaAlarms = useMemo(() => {
     return incidents
       .filter((x) => !x.solved && (x.title || "").trim().toUpperCase() === "ABA")
@@ -292,7 +344,7 @@ export default function App() {
     mapRef.current.setView([lat, lng], z);
   };
 
-  // ---------------------- SESSION BOOTSTRAP ----------------------
+  // ===== Session bootstrap + realtime =====
   useEffect(() => {
     (async () => {
       let code = getSessionCodeFromUrl();
@@ -335,6 +387,12 @@ export default function App() {
         status: "ON_STATION",
         lat: null,
         lng: null,
+        start_lat: null,
+        start_lng: null,
+        dest_lat: null,
+        dest_lng: null,
+        move_started_at: null,
+        speed_mps: null,
       }));
       await supabase.from("resource_states").upsert(seed, { onConflict: "session_id,resource_id" });
 
@@ -371,25 +429,21 @@ export default function App() {
     })();
   }, []);
 
-  // Alarmlyd ved NY ABA
+  // Alarmlyd ved ny ABA
   const seenIncidentIdsRef = useRef(new Set());
   useEffect(() => {
     const seen = seenIncidentIdsRef.current;
-    // finn nye incidents vi ikke har sett før
     for (const it of incidents) {
       if (!it?.id) continue;
       if (seen.has(it.id)) continue;
-
       seen.add(it.id);
 
       const isABA = (it.title || "").trim().toUpperCase() === "ABA";
-      if (isABA && !it.solved) {
-        playAlarmBeep();
-      }
+      if (isABA && !it.solved) playAlarmBeep();
     }
   }, [incidents]);
 
-  // ---------------------- MAP INIT (stations drawn once) ----------------------
+  // ===== Map init (stations always visible) =====
   useEffect(() => {
     if (!mapDivRef.current) return;
     if (mapRef.current) return;
@@ -406,17 +460,16 @@ export default function App() {
     incidentLayerRef.current = L.layerGroup().addTo(map);
     searchLayerRef.current = L.layerGroup().addTo(map);
 
-    // Stasjoner: tegn én gang, aldri clear
     stations.forEach((s) => {
-      L.marker([s.lat, s.lng], { icon: makeStationIcon(s.id), interactive: true, zIndexOffset: 2500 })
+      L.marker([s.lat, s.lng], { icon: makeStationIcon(s.id), interactive: true, zIndexOffset: 2600 })
         .bindPopup(`<b>${s.name}</b>`)
         .addTo(stationLayerRef.current);
     });
 
+    // Click: create incident OR move resource (shared movement)
     map.on("click", async (e) => {
       if (!sessionId) return;
 
-      // Opprett hendelse (vanlig modus)
       if (incidentModeRef.current) {
         const title = window.prompt("Overskrift/hendelsestype (f.eks. 'Brann i bolig'):");
         if (!title || !title.trim()) return;
@@ -433,31 +486,57 @@ export default function App() {
         return;
       }
 
-      // Plasser ressurs
       const rid = selectedResourceIdRef.current;
       if (!rid) return;
 
-      const r = resourcesMaster.find((x) => x.id === rid);
-      if (!r) return;
+      // Determine start position: if resource already has a marker position -> use it, else station coords
+      const station = stations.find(s => s.id === resourcesMaster.find(x => x.id === rid)?.stationId);
+      const marker = resourceMarkersRef.current.get(rid);
 
-      await supabase.from("resource_states").upsert(
-        {
-          session_id: sessionId,
-          resource_id: r.id,
-          call_sign: r.callSign,
-          type: r.type,
-          station_id: r.stationId,
-          status: "DEPLOYED",
-          lat: e.latlng.lat,
-          lng: e.latlng.lng,
-        },
-        { onConflict: "session_id,resource_id" }
-      );
+      let fromLat = station?.lat ?? DEFAULT_CENTER[0];
+      let fromLng = station?.lng ?? DEFAULT_CENTER[1];
+
+      if (marker) {
+        const ll = marker.getLatLng();
+        fromLat = ll.lat;
+        fromLng = ll.lng;
+      } else {
+        // fallback: if DB has lat/lng and it's deployed
+        const st = resourceStates.find(x => x.resource_id === rid);
+        if (st?.lat != null && st?.lng != null) {
+          fromLat = st.lat; fromLng = st.lng;
+        }
+      }
+
+      const toLat = e.latlng.lat;
+      const toLng = e.latlng.lng;
+
+      const speedMps = 16.7; // ~60 km/t
+
+      // Start shared movement: everyone will animate based on these fields
+      const { error } = await supabase.from("resource_states").update({
+        status: "MOVING",
+        start_lat: fromLat,
+        start_lng: fromLng,
+        dest_lat: toLat,
+        dest_lng: toLng,
+        move_started_at: new Date().toISOString(),
+        speed_mps: speedMps,
+        // set current pos to start (optional)
+        lat: fromLat,
+        lng: fromLng,
+      }).eq("session_id", sessionId).eq("resource_id", rid);
+
+      if (error) {
+        console.error("Start movement failed:", error);
+        alert(`Kunne ikke starte bevegelse: ${error.message}`);
+        return;
+      }
 
       setSelectedResourceId(null);
     });
 
-    setTimeout(() => map.invalidateSize(), 100);
+    setTimeout(() => map.invalidateSize(), 120);
     const onResize = () => map.invalidateSize();
     window.addEventListener("resize", onResize);
 
@@ -466,43 +545,197 @@ export default function App() {
       map.remove();
       mapRef.current = null;
     };
-  }, [sessionId]);
+  }, [sessionId, resourceStates]);
 
-  // ---------------------- LAYERS RENDER (resources/incidents only) ----------------------
+  // ===== Create / update resource markers (do NOT animate here) =====
   useEffect(() => {
     if (!resourceLayerRef.current) return;
-    resourceLayerRef.current.clearLayers();
 
-    resourceStates
-      .filter((x) => x.status === "DEPLOYED" && x.lat != null && x.lng != null)
-      .forEach((r) => {
-        L.marker([r.lat, r.lng], { icon: makeFireTruckIcon(r.call_sign), interactive: true, zIndexOffset: 1800 })
-          .bindPopup(`<b>${r.call_sign}</b><br/>${r.type}`)
-          .addTo(resourceLayerRef.current);
-      });
+    // Ensure markers exist for any resource that is DEPLOYED or MOVING (and has any position)
+    const layer = resourceLayerRef.current;
+    const mapMarkers = resourceMarkersRef.current;
+
+    // remove markers for resources that are ON_STATION (cleaner map)
+    for (const [rid, m] of mapMarkers.entries()) {
+      const st = resourceStates.find(x => x.resource_id === rid);
+      if (!st || st.status === "ON_STATION") {
+        layer.removeLayer(m);
+        mapMarkers.delete(rid);
+      }
+    }
+
+    for (const st of resourceStates) {
+      if (!st) continue;
+      if (st.status !== "DEPLOYED" && st.status !== "MOVING") continue;
+
+      // initial position: if MOVING use start if available; else lat/lng; else station
+      let lat = st.lat;
+      let lng = st.lng;
+
+      if ((lat == null || lng == null) && st.status === "MOVING" && st.start_lat != null && st.start_lng != null) {
+        lat = st.start_lat; lng = st.start_lng;
+      }
+
+      if (lat == null || lng == null) {
+        const master = resourcesMaster.find(x => x.id === st.resource_id);
+        const station = stations.find(s => s.id === master?.stationId);
+        lat = station?.lat ?? DEFAULT_CENTER[0];
+        lng = station?.lng ?? DEFAULT_CENTER[1];
+      }
+
+      const existing = mapMarkers.get(st.resource_id);
+      if (!existing) {
+        const m = L.marker([lat, lng], { icon: makeFireTruckIcon(st.call_sign), interactive: true, zIndexOffset: 2000 })
+          .bindPopup(`<b>${st.call_sign}</b><br/>${st.type}`)
+          .addTo(layer);
+        mapMarkers.set(st.resource_id, m);
+      } else {
+        // if not moving, keep marker synced to DB final position
+        if (st.status === "DEPLOYED" && st.lat != null && st.lng != null) {
+          existing.setLatLng([st.lat, st.lng]);
+        }
+      }
+    }
   }, [resourceStates]);
 
+  // ===== Incidents layer =====
   useEffect(() => {
     if (!incidentLayerRef.current) return;
     incidentLayerRef.current.clearLayers();
 
     incidents.forEach((h) => {
-      const title = (h.title || "").trim().toUpperCase() === "ABA"
-        ? `ABA${h.source ? ` – ${h.source}` : ""}`
-        : h.title;
+      const isABA = (h.title || "").trim().toUpperCase() === "ABA";
+      const title = isABA ? `ABA${h.source ? ` – ${h.source}` : ""}` : h.title;
 
-      L.marker([h.lat, h.lng], { icon: makeIncidentIcon(title, h.solved), interactive: true, zIndexOffset: 2000 })
+      L.marker([h.lat, h.lng], { icon: makeIncidentIcon(title, h.solved), interactive: true, zIndexOffset: 2200 })
         .bindPopup(`<b>${title}</b><br/>Status: ${h.solved ? "Løst" : "Aktiv"}`)
         .addTo(incidentLayerRef.current);
     });
   }, [incidents]);
 
-  // ---------------------- ACTIONS ----------------------
+  // ===== Shared movement animator loop (ALL clients) =====
+  useEffect(() => {
+    let cancelled = false;
+
+    async function ensureRouteForState(st) {
+      const key = `${st.resource_id}::${st.move_started_at}::${st.dest_lat},${st.dest_lng}`;
+      if (routeCacheRef.current.has(key)) return { key, ...routeCacheRef.current.get(key) };
+
+      const fromLat = st.start_lat ?? st.lat;
+      const fromLng = st.start_lng ?? st.lng;
+      const toLat = st.dest_lat;
+      const toLng = st.dest_lng;
+
+      // fall back to straight line if missing coords
+      if (fromLat == null || fromLng == null || toLat == null || toLng == null) {
+        const line = [[fromLat ?? DEFAULT_CENTER[0], fromLng ?? DEFAULT_CENTER[1]], [toLat ?? DEFAULT_CENTER[0], toLng ?? DEFAULT_CENTER[1]]];
+        const cum = buildDistances(line);
+        const total = cum[cum.length - 1];
+        routeCacheRef.current.set(key, { line, cum, total, fallback: true });
+        return { key, line, cum, total, fallback: true };
+      }
+
+      try {
+        const line = await fetchRouteOSRM(fromLat, fromLng, toLat, toLng);
+        const cum = buildDistances(line);
+        const total = cum[cum.length - 1];
+        routeCacheRef.current.set(key, { line, cum, total, fallback: false });
+        return { key, line, cum, total, fallback: false };
+      } catch (e) {
+        // fallback: straight line
+        const line = [[fromLat, fromLng], [toLat, toLng]];
+        const cum = buildDistances(line);
+        const total = cum[cum.length - 1];
+        routeCacheRef.current.set(key, { line, cum, total, fallback: true });
+        return { key, line, cum, total, fallback: true };
+      }
+    }
+
+    async function maybeFinalize(st) {
+      // attempt to finalize only if still MOVING and move_started_at matches
+      const { data, error } = await supabase
+        .from("resource_states")
+        .update({
+          status: "DEPLOYED",
+          lat: st.dest_lat,
+          lng: st.dest_lng,
+          start_lat: null,
+          start_lng: null,
+          dest_lat: null,
+          dest_lng: null,
+          move_started_at: null,
+          speed_mps: null,
+        })
+        .eq("session_id", st.session_id)
+        .eq("resource_id", st.resource_id)
+        .eq("status", "MOVING")
+        .eq("move_started_at", st.move_started_at)
+        .select();
+
+      // If 0 rows updated => someone else already finalized. That's fine.
+      if (error) {
+        console.warn("Finalize movement failed:", error);
+        return;
+      }
+      return data;
+    }
+
+    async function tick() {
+      if (cancelled) return;
+
+      const nowMs = Date.now();
+      const moving = resourceStates.filter(x => x.status === "MOVING" && x.dest_lat != null && x.dest_lng != null && x.move_started_at);
+
+      for (const st of moving) {
+        const marker = resourceMarkersRef.current.get(st.resource_id);
+        if (!marker) continue;
+
+        const t0 = parseTs(st.move_started_at);
+        if (!t0) continue;
+
+        const speed = (st.speed_mps && Number(st.speed_mps) > 0) ? Number(st.speed_mps) : 16.7;
+        const elapsedSec = Math.max(0, (nowMs - t0) / 1000);
+        const dist = elapsedSec * speed;
+
+        const route = await ensureRouteForState(st);
+        if (cancelled) return;
+
+        const total = route.total || 0;
+        const pos = interpolateOnLine(route.line, route.cum, dist);
+        marker.setLatLng(pos);
+
+        // arrived
+        if (dist >= total - 3) {
+          // snap to destination and try finalize
+          marker.setLatLng([st.dest_lat, st.dest_lng]);
+          await maybeFinalize(st);
+        }
+      }
+
+      animHandleRef.current = requestAnimationFrame(tick);
+    }
+
+    animHandleRef.current = requestAnimationFrame(tick);
+    return () => {
+      cancelled = true;
+      if (animHandleRef.current) cancelAnimationFrame(animHandleRef.current);
+      animHandleRef.current = null;
+    };
+  }, [resourceStates]);
+
+  // ===== Actions =====
   const returnToStation = async (resourceId) => {
     if (!sessionId) return;
+
     await supabase
       .from("resource_states")
-      .update({ status: "ON_STATION", lat: null, lng: null })
+      .update({
+        status: "ON_STATION",
+        lat: null, lng: null,
+        start_lat: null, start_lng: null,
+        dest_lat: null, dest_lng: null,
+        move_started_at: null, speed_mps: null,
+      })
       .eq("session_id", sessionId)
       .eq("resource_id", resourceId);
 
@@ -548,18 +781,21 @@ export default function App() {
   };
 
   const generateABA = async () => {
-    if (!sessionId) return;
+    if (!sessionId) {
+      alert("Venter på økt… prøv igjen.");
+      return;
+    }
     if (!requireInstructor()) return;
 
     const src = abaSource.trim();
     if (!src) {
-      alert("Instruktør: fyll inn hvor alarmen kommer fra (kilde).");
+      alert("Fyll inn hvor alarmen kommer fra (kilde).");
       return;
     }
 
     const { lat, lng } = randomPointInEastBox();
 
-    await supabase.from("incidents").insert({
+    const { error } = await supabase.from("incidents").insert({
       session_id: sessionId,
       title: "ABA",
       source: src,
@@ -568,16 +804,21 @@ export default function App() {
       solved: false,
     });
 
+    if (error) {
+      console.error("ABA insert feilet:", error);
+      alert(`ABA feilet: ${error.message}`);
+      return;
+    }
+
     zoomTo(lat, lng, 13);
-    setExpandedIncidentId(null);
   };
 
-  // ---------------------- SEARCH ----------------------
+  // ===== Search (Nominatim) =====
   const runSearch = async () => {
     const raw = q.trim();
     if (!raw) return;
-    const query = /norge|norway/i.test(raw) ? raw : `${raw}, Norge`;
 
+    const query = /norge|norway/i.test(raw) ? raw : `${raw}, Norge`;
     setSearching(true);
     setSearchError("");
     setResults([]);
@@ -614,12 +855,14 @@ export default function App() {
     zoomTo(r.lat, r.lon, 15);
     if (searchLayerRef.current) {
       searchLayerRef.current.clearLayers();
-      L.circleMarker([r.lat, r.lon], { radius: 8, weight: 2, color: C.accent, fillColor: C.accent, fillOpacity: 0.2 })
-        .addTo(searchLayerRef.current);
+      L.circleMarker([r.lat, r.lon], {
+        radius: 8, weight: 2,
+        color: C.accent, fillColor: C.accent, fillOpacity: 0.2,
+      }).addTo(searchLayerRef.current);
     }
   };
 
-  // ---------------------- RENDER ----------------------
+  // ===== Render =====
   return (
     <div style={{
       height: "100vh",
@@ -630,7 +873,7 @@ export default function App() {
       background: C.bg,
       fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
     }}>
-      {/* LEFT: RESOURCES */}
+      {/* LEFT */}
       <div style={panelStyle}>
         <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", gap:8 }}>
           <div style={{ fontWeight:900, fontSize:16 }}>Brannressurser</div>
@@ -654,18 +897,10 @@ export default function App() {
                 <button
                   onClick={() => setExpandedStations(prev => ({ ...prev, [s.id]: !prev[s.id] }))}
                   style={{
-                    width: "100%",
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "center",
-                    border: "none",
-                    background: "transparent",
-                    color: C.text,
-                    cursor: "pointer",
-                    padding: 0,
+                    width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center",
+                    border: "none", background: "transparent", color: C.text, cursor: "pointer", padding: 0,
                     fontWeight: 900,
                   }}
-                  title="Kollaps/utvid"
                 >
                   <span>{s.name}</span>
                   <span style={{ color: C.muted, fontWeight: 900 }}>{isOpen ? "▾" : "▸"}</span>
@@ -675,7 +910,8 @@ export default function App() {
                   <div style={{ marginTop: 10, display:"flex", flexDirection:"column", gap:8 }}>
                     {(resourcesByStation[s.id] || []).map((r) => {
                       const state = resourceStates.find((x) => x.resource_id === r.id);
-                      const isPlaced = state?.status === "DEPLOYED";
+                      const isPlaced = state?.status === "DEPLOYED" || state?.status === "MOVING";
+                      const isMoving = state?.status === "MOVING";
                       const isSelected = selectedResourceId === r.id;
 
                       return (
@@ -686,14 +922,11 @@ export default function App() {
                               setSelectedResourceId(isSelected ? null : r.id);
                             }}
                             style={{
-                              flex: 1,
-                              textAlign: "left",
-                              borderRadius: 12,
-                              padding: 10,
+                              flex: 1, textAlign: "left",
+                              borderRadius: 12, padding: 10,
                               border: `1px solid ${C.border}`,
                               background: isSelected ? "rgba(147,197,253,0.12)" : "rgba(255,255,255,0.03)",
-                              color: C.text,
-                              cursor: "pointer",
+                              color: C.text, cursor: "pointer",
                             }}
                           >
                             <div style={{ fontWeight: 900 }}>
@@ -701,7 +934,7 @@ export default function App() {
                               <span style={{ fontWeight: 700, color: C.muted, fontSize: 12 }}>({r.type})</span>
                             </div>
                             <div style={{ fontSize: 12, color: C.muted }}>
-                              {isPlaced ? "Status: Ute / plassert" : "Status: På stasjon"}
+                              {isMoving ? "Status: På vei" : isPlaced ? "Status: Ute" : "Status: På stasjon"}
                             </div>
                           </button>
 
@@ -710,13 +943,10 @@ export default function App() {
                               onClick={() => returnToStation(r.id)}
                               title="Tilbake til stasjon"
                               style={{
-                                width: 52,
-                                borderRadius: 12,
+                                width: 52, borderRadius: 12,
                                 border: `1px solid ${C.border}`,
                                 background: "rgba(255,255,255,0.03)",
-                                color: C.text,
-                                cursor: "pointer",
-                                fontWeight: 900,
+                                color: C.text, cursor: "pointer", fontWeight: 900,
                               }}
                             >
                               ↩
@@ -733,7 +963,7 @@ export default function App() {
         </div>
       </div>
 
-      {/* CENTER: MAP */}
+      {/* CENTER MAP */}
       <div style={{
         background: C.panel,
         borderRadius: 14,
@@ -743,21 +973,15 @@ export default function App() {
         position: "relative",
         height: "calc(100vh - 24px)",
       }}>
-        {/* Search box */}
+        {/* Search */}
         <div style={{
-          position: "absolute",
-          zIndex: 800,
-          top: 10,
-          left: "50%",
+          position: "absolute", zIndex: 800, top: 10, left: "50%",
           transform: "translateX(-50%)",
           width: "min(560px, calc(100% - 24px))",
         }}>
           <div style={{
-            display: "flex",
-            gap: 8,
-            padding: 10,
-            borderRadius: 14,
-            border: `1px solid ${C.border}`,
+            display: "flex", gap: 8, padding: 10,
+            borderRadius: 14, border: `1px solid ${C.border}`,
             background: "rgba(15,23,42,0.92)",
             boxShadow: "0 10px 28px rgba(0,0,0,0.45)",
           }}>
@@ -770,13 +994,10 @@ export default function App() {
               }}
               placeholder="Søk adresse (f.eks. 'Storgata 10, Ski')"
               style={{
-                flex: 1,
-                borderRadius: 12,
+                flex: 1, borderRadius: 12,
                 border: `1px solid ${C.border}`,
                 background: "rgba(255,255,255,0.03)",
-                color: C.text,
-                padding: "10px 12px",
-                outline: "none",
+                color: C.text, padding: "10px 12px", outline: "none",
               }}
             />
             <button onClick={runSearch} style={buttonStyle(false)} disabled={searching}>
@@ -784,12 +1005,10 @@ export default function App() {
             </button>
             <button
               onClick={() => {
-                setResults([]);
-                setSearchError("");
+                setResults([]); setSearchError("");
                 if (searchLayerRef.current) searchLayerRef.current.clearLayers();
               }}
               style={buttonStyle(false)}
-              title="Fjern søkemarkør"
             >
               Rydd
             </button>
@@ -804,13 +1023,10 @@ export default function App() {
                   key={idx}
                   onClick={() => pickResult(r)}
                   style={{
-                    width: "100%",
-                    textAlign: "left",
+                    width: "100%", textAlign: "left",
                     padding: "10px 12px",
-                    border: "none",
-                    background: "transparent",
-                    color: C.text,
-                    cursor: "pointer",
+                    border: "none", background: "transparent",
+                    color: C.text, cursor: "pointer",
                     borderTop: idx === 0 ? "none" : `1px solid ${C.border}`,
                   }}
                 >
@@ -824,30 +1040,26 @@ export default function App() {
 
         {/* Status */}
         <div style={{
-          position: "absolute",
-          zIndex: 700,
-          top: 10,
-          left: 10,
+          position: "absolute", zIndex: 700, top: 10, left: 10,
           padding: "8px 10px",
           background: "rgba(15,23,42,0.92)",
           border: `1px solid ${C.border}`,
           borderRadius: 12,
-          fontSize: 12,
-          color: C.text,
+          fontSize: 12, color: C.text,
         }}>
           {incidentMode
             ? "Hendelsemodus: klikk i kartet"
             : selectedResourceId
-              ? `Klikk i kartet for å plassere ${resourcesMaster.find(x=>x.id===selectedResourceId)?.callSign || ""}`
+              ? `Klikk i kartet for å sende ${resourcesMaster.find(x=>x.id===selectedResourceId)?.callSign || ""} (viser kjøring for alle)`
               : "Velg ressurs eller trykk “Ny hendelse”"}
         </div>
 
         <div ref={mapDivRef} style={{ height: "100%", width: "100%" }} />
       </div>
 
-      {/* RIGHT: INCIDENTS + LOGG + ABA ALARMS */}
+      {/* RIGHT */}
       <div style={{ ...panelStyle, display: "flex", flexDirection: "column", gap: 12 }}>
-        {/* Instruktørpanel */}
+        {/* Instructor */}
         <div style={cardStyle}>
           <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
             <div style={{ fontWeight: 900 }}>Instruktør</div>
@@ -883,17 +1095,21 @@ export default function App() {
                   outline: "none",
                 }}
               />
-              <button onClick={generateABA} style={buttonStyle(false)}>
+              <button
+                onClick={generateABA}
+                style={{ ...buttonStyle(false), opacity: sessionId ? 1 : 0.5, cursor: sessionId ? "pointer" : "not-allowed" }}
+                disabled={!sessionId}
+              >
                 Generer ABA-alarm
               </button>
               <div style={{ fontSize: 12, color: C.muted }}>
-                Alarm går til alle i samme økt (og spiller lyd).
+                ABA vises i rødt felt nederst + lyd.
               </div>
             </div>
           )}
         </div>
 
-        {/* Hendelser (accordion) */}
+        {/* Incidents */}
         <div style={{ flex: 1, overflow: "auto" }}>
           <div style={{ fontWeight: 900, fontSize: 16 }}>Hendelser</div>
           <div style={{ marginTop: 8, fontSize: 12, color: C.muted }}>
@@ -920,19 +1136,11 @@ export default function App() {
                     <button
                       onClick={() => { setExpandedIncidentId(prev => (prev === h.id ? null : h.id)); zoomTo(h.lat, h.lng, 13); }}
                       style={{
-                        width: "100%",
-                        textAlign: "left",
-                        padding: 10,
-                        border: "none",
-                        background: "transparent",
-                        color: C.text,
-                        cursor: "pointer",
-                        display: "flex",
-                        justifyContent: "space-between",
-                        alignItems: "center",
-                        gap: 8,
+                        width: "100%", textAlign: "left",
+                        padding: 10, border: "none", background: "transparent",
+                        color: C.text, cursor: "pointer",
+                        display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8,
                       }}
-                      title="Kollaps/utvid"
                     >
                       <div>
                         <div style={{ fontWeight: 900 }}>
@@ -962,11 +1170,9 @@ export default function App() {
                         </div>
 
                         <div style={{
-                          maxHeight: 200,
-                          overflow: "auto",
+                          maxHeight: 200, overflow: "auto",
                           border: `1px solid ${C.border}`,
-                          borderRadius: 12,
-                          padding: 10,
+                          borderRadius: 12, padding: 10,
                           background: "rgba(255,255,255,0.02)",
                         }}>
                           {hLogs.length === 0 ? (
@@ -989,13 +1195,10 @@ export default function App() {
                             onChange={(e) => setAuthor(e.target.value)}
                             placeholder="Navn (valgfritt)"
                             style={{
-                              width: 160,
-                              borderRadius: 12,
+                              width: 160, borderRadius: 12,
                               border: `1px solid ${C.border}`,
                               background: "rgba(255,255,255,0.03)",
-                              color: C.text,
-                              padding: "10px 12px",
-                              outline: "none",
+                              color: C.text, padding: "10px 12px", outline: "none",
                             }}
                           />
                           <input
@@ -1004,13 +1207,10 @@ export default function App() {
                             onKeyDown={(e) => { if (e.key === "Enter") sendLog(h.id); }}
                             placeholder="Skriv logg…"
                             style={{
-                              flex: 1,
-                              borderRadius: 12,
+                              flex: 1, borderRadius: 12,
                               border: `1px solid ${C.border}`,
                               background: "rgba(255,255,255,0.03)",
-                              color: C.text,
-                              padding: "10px 12px",
-                              outline: "none",
+                              color: C.text, padding: "10px 12px", outline: "none",
                             }}
                           />
                           <button onClick={() => sendLog(h.id)} style={buttonStyle(false)}>Send</button>
@@ -1024,7 +1224,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* ABA alarmfelt nederst til høyre */}
+        {/* ABA field */}
         <div style={{
           borderRadius: 14,
           border: `1px solid ${C.alarmBorder}`,
