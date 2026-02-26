@@ -287,7 +287,8 @@ export default function App() {
 
   // Instruktør / ABA
   const [isInstructor, setIsInstructor] = useState(() => localStorage.getItem("isInstructor") === "1");
-  const [abaSource, setAbaSource] = useState("");
+  const [abaAddress, setAbaAddress] = useState(""); // NYTT: adresse (påkrevd)
+  const [abaObjectName, setAbaObjectName] = useState(""); // NYTT: objektnavn (valgfritt)
 
   // Search
   const [q, setQ] = useState("");
@@ -352,6 +353,28 @@ export default function App() {
     if (!mapRef.current) return;
     const z = Math.max(mapRef.current.getZoom(), minZoom);
     mapRef.current.setView([lat, lng], z);
+  };
+
+  // NYTT: felles geokoding (samme som adressesøket)
+  const geocodeAddress = async (raw) => {
+    const q0 = (raw || "").trim();
+    if (!q0) return null;
+
+    const query = /norge|norway/i.test(q0) ? q0 : `${q0}, Norge`;
+    const viewbox = "10.0,59.0,11.8,60.3";
+    const url =
+      "https://nominatim.openstreetmap.org/search" +
+      "?format=jsonv2&limit=1&addressdetails=1&countrycodes=no" +
+      "&viewbox=" + encodeURIComponent(viewbox) +
+      "&bounded=1&q=" + encodeURIComponent(query);
+
+    const res = await fetch(url, { headers: { Accept: "application/json", "Accept-Language": "no" } });
+    if (!res.ok) throw new Error("Nominatim failed");
+    const data = await res.json();
+    const hit = (data || [])[0];
+    if (!hit?.lat || !hit?.lon) return null;
+
+    return { lat: Number(hit.lat), lng: Number(hit.lon), display: hit.display_name || q0 };
   };
 
   // NYTT: beregn nå-posisjon for MOVING ressurs (for omdirigering)
@@ -754,7 +777,7 @@ export default function App() {
         const t0 = parseTs(st.move_started_at);
         if (!t0) continue;
 
-        const speed = (st.speed_mps && Number(st.speed_mps) > 0) ? Number(st.speed_mps) : 20.0; // litt fortere
+        const speed = (st.speed_mps && Number(st.speed_mps) > 0) ? Number(st.speed_mps) : 20.0;
         const elapsedSec = Math.max(0, (nowMs - t0) / 1000);
         const dist = elapsedSec * speed;
 
@@ -830,15 +853,7 @@ export default function App() {
     return true;
   };
 
-  const randomPointInEastBox = () => {
-    const minLat = 59.20, maxLat = 60.20;
-    const minLng = 10.10, maxLng = 11.50;
-    return {
-      lat: minLat + Math.random() * (maxLat - minLat),
-      lng: minLng + Math.random() * (maxLng - minLng),
-    };
-  };
-
+  // ENDRET: ABA krever konkret adresse (geokodes)
   const generateABA = async () => {
     if (!sessionId) {
       alert("Venter på økt… prøv igjen.");
@@ -846,20 +861,32 @@ export default function App() {
     }
     if (!requireInstructor()) return;
 
-    const src = abaSource.trim();
-    if (!src) {
-      alert("Fyll inn hvor alarmen kommer fra (kilde).");
+    const addr = abaAddress.trim();
+    if (!addr) {
+      alert("Fyll inn en konkret adresse (påkrevd).");
       return;
     }
 
-    const { lat, lng } = randomPointInEastBox();
+    let hit = null;
+    try {
+      hit = await geocodeAddress(addr);
+    } catch {
+      hit = null;
+    }
+    if (!hit) {
+      alert("Fant ikke adressen. Prøv mer presist (gate + nummer + sted).");
+      return;
+    }
+
+    const name = abaObjectName.trim();
+    const source = name ? `${name} – ${hit.display}` : hit.display;
 
     const { error } = await supabase.from("incidents").insert({
       session_id: sessionId,
       title: "ABA",
-      source: src,
-      lat,
-      lng,
+      source,
+      lat: hit.lat,
+      lng: hit.lng,
       solved: false,
     });
 
@@ -869,7 +896,7 @@ export default function App() {
       return;
     }
 
-    zoomTo(lat, lng, 13);
+    zoomTo(hit.lat, hit.lng, 13);
   };
 
   // ===== Search (Nominatim) =====
@@ -926,7 +953,7 @@ export default function App() {
     <div style={{
       height: "100vh",
       display: "grid",
-      gridTemplateColumns: "380px 1fr 520px",
+      gridTemplateColumns: "320px 1fr 520px", // ENDRET: venstre litt smalere
       gap: 12,
       padding: 12,
       background: C.bg,
@@ -936,12 +963,6 @@ export default function App() {
       <div style={panelStyle}>
         <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", gap:8 }}>
           <div style={{ fontWeight:900, fontSize:16 }}>Brannressurser</div>
-          <button
-            onClick={() => { setSelectedResourceId(null); setIncidentMode(v => !v); }}
-            style={buttonStyle(incidentMode)}
-          >
-            Ny hendelse
-          </button>
         </div>
 
         <div style={{ marginTop: 8, fontSize: 12, color: C.muted }}>
@@ -1036,7 +1057,7 @@ export default function App() {
         <div style={{
           position: "absolute", zIndex: 800, top: 10, left: "50%",
           transform: "translateX(-50%)",
-          width: "min(560px, calc(100% - 24px))",
+          width: "min(720px, calc(100% - 24px))", // litt bredere for knapp + søk
         }}>
           <div style={{
             display: "flex", gap: 8, padding: 10,
@@ -1059,6 +1080,16 @@ export default function App() {
                 color: C.text, padding: "10px 12px", outline: "none",
               }}
             />
+
+            {/* ENDRET: Ny hendelse-knappen flyttet hit */}
+            <button
+              onClick={() => { setSelectedResourceId(null); setIncidentMode(v => !v); }}
+              style={buttonStyle(incidentMode)}
+              title="Sett kartet i hendelsemodus"
+            >
+              Ny hendelse
+            </button>
+
             <button onClick={runSearch} style={buttonStyle(false)} disabled={searching}>
               {searching ? "Søker…" : "Søk"}
             </button>
@@ -1140,10 +1171,11 @@ export default function App() {
 
           {isInstructor && (
             <div style={{ marginTop: 10, display:"flex", flexDirection:"column", gap: 8 }}>
+              {/* NYTT: ABA-adresse (påkrevd) */}
               <input
-                value={abaSource}
-                onChange={(e) => setAbaSource(e.target.value)}
-                placeholder="ABA fra (f.eks. 'Rema 1000 Ski', 'Skole - sone 3')"
+                value={abaAddress}
+                onChange={(e) => setAbaAddress(e.target.value)}
+                placeholder="ABA adresse (påkrevd) – f.eks. 'Storgata 10, Ski'"
                 style={{
                   width: "100%",
                   borderRadius: 12,
@@ -1154,6 +1186,23 @@ export default function App() {
                   outline: "none",
                 }}
               />
+
+              {/* NYTT: objektnavn (valgfritt) */}
+              <input
+                value={abaObjectName}
+                onChange={(e) => setAbaObjectName(e.target.value)}
+                placeholder="Objektnavn (valgfritt) – f.eks. 'Rema 1000'"
+                style={{
+                  width: "100%",
+                  borderRadius: 12,
+                  border: `1px solid ${C.border}`,
+                  background: "rgba(255,255,255,0.03)",
+                  color: C.text,
+                  padding: "10px 12px",
+                  outline: "none",
+                }}
+              />
+
               <button
                 onClick={generateABA}
                 style={{ ...buttonStyle(false), opacity: sessionId ? 1 : 0.5, cursor: sessionId ? "pointer" : "not-allowed" }}
@@ -1161,8 +1210,9 @@ export default function App() {
               >
                 Generer ABA-alarm
               </button>
+
               <div style={{ fontSize: 12, color: C.muted }}>
-                ABA vises i rødt felt nederst + lyd.
+                Krever adresse (geokodes som adressesøket). Objektnavn er valgfritt.
               </div>
             </div>
           )}
