@@ -344,6 +344,45 @@ export default function App() {
     mapRef.current.setView([lat, lng], z);
   };
 
+  // NYTT: beregn nå-posisjon for MOVING ressurs (for omdirigering)
+  const getCurrentMovingPosition = async (st) => {
+    const t0 = parseTs(st.move_started_at);
+    if (!t0) return null;
+
+    const nowMs = Date.now();
+    const speed = (st.speed_mps && Number(st.speed_mps) > 0) ? Number(st.speed_mps) : 16.7;
+    const elapsedSec = Math.max(0, (nowMs - t0) / 1000);
+    const dist = elapsedSec * speed;
+
+    const fromLat = st.start_lat ?? st.lat;
+    const fromLng = st.start_lng ?? st.lng;
+    const toLat = st.dest_lat;
+    const toLng = st.dest_lng;
+
+    if (fromLat == null || fromLng == null || toLat == null || toLng == null) return null;
+
+    const key = `${st.resource_id}::${st.move_started_at}::${toLat},${toLng}`;
+    let cached = routeCacheRef.current.get(key);
+
+    if (!cached) {
+      try {
+        const line = await fetchRouteOSRM(fromLat, fromLng, toLat, toLng);
+        const cum = buildDistances(line);
+        const total = cum[cum.length - 1];
+        cached = { line, cum, total, fallback: false };
+        routeCacheRef.current.set(key, cached);
+      } catch {
+        const line = [[fromLat, fromLng], [toLat, toLng]];
+        const cum = buildDistances(line);
+        const total = cum[cum.length - 1];
+        cached = { line, cum, total, fallback: true };
+        routeCacheRef.current.set(key, cached);
+      }
+    }
+
+    return interpolateOnLine(cached.line, cached.cum, dist);
+  };
+
   // ===== Session bootstrap + realtime =====
   useEffect(() => {
     (async () => {
@@ -444,6 +483,7 @@ export default function App() {
   }, [incidents]);
 
   // ===== Map init (stations always visible) =====
+  // ENDRET: denne skal kun kjøre på sessionId, ikke på resourceStates (hindrer “midstilling”)
   useEffect(() => {
     if (!mapDivRef.current) return;
     if (mapRef.current) return;
@@ -489,31 +529,49 @@ export default function App() {
       const rid = selectedResourceIdRef.current;
       if (!rid) return;
 
-      // Determine start position: if resource already has a marker position -> use it, else station coords
-      const station = stations.find(s => s.id === resourcesMaster.find(x => x.id === rid)?.stationId);
+      // ENDRET: Startposisjon skal være “der den er nå” hvis MOVING
+      const current = resourceStates.find(x => x.resource_id === rid);
+      const master = resourcesMaster.find(x => x.id === rid);
+      const station = stations.find(s => s.id === master?.stationId);
       const marker = resourceMarkersRef.current.get(rid);
 
-      let fromLat = station?.lat ?? DEFAULT_CENTER[0];
-      let fromLng = station?.lng ?? DEFAULT_CENTER[1];
+      let fromLat = null;
+      let fromLng = null;
 
-      if (marker) {
-        const ll = marker.getLatLng();
-        fromLat = ll.lat;
-        fromLng = ll.lng;
-      } else {
-        // fallback: if DB has lat/lng and it's deployed
-        const st = resourceStates.find(x => x.resource_id === rid);
-        if (st?.lat != null && st?.lng != null) {
-          fromLat = st.lat; fromLng = st.lng;
+      // 1) Hvis MOVING: start der den faktisk er nå
+      if (current?.status === "MOVING") {
+        const pos = await getCurrentMovingPosition(current);
+        if (pos) {
+          fromLat = pos[0];
+          fromLng = pos[1];
         }
+      }
+
+      // 2) Ellers: hvis marker finnes, bruk den
+      if (fromLat == null || fromLng == null) {
+        if (marker) {
+          const ll = marker.getLatLng();
+          fromLat = ll.lat;
+          fromLng = ll.lng;
+        }
+      }
+
+      // 3) Ellers: DB posisjon
+      if ((fromLat == null || fromLng == null) && current?.lat != null && current?.lng != null) {
+        fromLat = current.lat;
+        fromLng = current.lng;
+      }
+
+      // 4) Ellers: stasjon
+      if (fromLat == null || fromLng == null) {
+        fromLat = station?.lat ?? DEFAULT_CENTER[0];
+        fromLng = station?.lng ?? DEFAULT_CENTER[1];
       }
 
       const toLat = e.latlng.lat;
       const toLng = e.latlng.lng;
-
       const speedMps = 16.7; // ~60 km/t
 
-      // Start shared movement: everyone will animate based on these fields
       const { error } = await supabase.from("resource_states").update({
         status: "MOVING",
         start_lat: fromLat,
@@ -522,7 +580,6 @@ export default function App() {
         dest_lng: toLng,
         move_started_at: new Date().toISOString(),
         speed_mps: speedMps,
-        // set current pos to start (optional)
         lat: fromLat,
         lng: fromLng,
       }).eq("session_id", sessionId).eq("resource_id", rid);
@@ -545,17 +602,15 @@ export default function App() {
       map.remove();
       mapRef.current = null;
     };
-  }, [sessionId, resourceStates]);
+  }, [sessionId]);
 
   // ===== Create / update resource markers (do NOT animate here) =====
   useEffect(() => {
     if (!resourceLayerRef.current) return;
 
-    // Ensure markers exist for any resource that is DEPLOYED or MOVING (and has any position)
     const layer = resourceLayerRef.current;
     const mapMarkers = resourceMarkersRef.current;
 
-    // remove markers for resources that are ON_STATION (cleaner map)
     for (const [rid, m] of mapMarkers.entries()) {
       const st = resourceStates.find(x => x.resource_id === rid);
       if (!st || st.status === "ON_STATION") {
@@ -568,7 +623,6 @@ export default function App() {
       if (!st) continue;
       if (st.status !== "DEPLOYED" && st.status !== "MOVING") continue;
 
-      // initial position: if MOVING use start if available; else lat/lng; else station
       let lat = st.lat;
       let lng = st.lng;
 
@@ -590,7 +644,6 @@ export default function App() {
           .addTo(layer);
         mapMarkers.set(st.resource_id, m);
       } else {
-        // if not moving, keep marker synced to DB final position
         if (st.status === "DEPLOYED" && st.lat != null && st.lng != null) {
           existing.setLatLng([st.lat, st.lng]);
         }
@@ -626,7 +679,6 @@ export default function App() {
       const toLat = st.dest_lat;
       const toLng = st.dest_lng;
 
-      // fall back to straight line if missing coords
       if (fromLat == null || fromLng == null || toLat == null || toLng == null) {
         const line = [[fromLat ?? DEFAULT_CENTER[0], fromLng ?? DEFAULT_CENTER[1]], [toLat ?? DEFAULT_CENTER[0], toLng ?? DEFAULT_CENTER[1]]];
         const cum = buildDistances(line);
@@ -641,8 +693,7 @@ export default function App() {
         const total = cum[cum.length - 1];
         routeCacheRef.current.set(key, { line, cum, total, fallback: false });
         return { key, line, cum, total, fallback: false };
-      } catch (e) {
-        // fallback: straight line
+      } catch {
         const line = [[fromLat, fromLng], [toLat, toLng]];
         const cum = buildDistances(line);
         const total = cum[cum.length - 1];
@@ -652,7 +703,6 @@ export default function App() {
     }
 
     async function maybeFinalize(st) {
-      // attempt to finalize only if still MOVING and move_started_at matches
       const { data, error } = await supabase
         .from("resource_states")
         .update({
@@ -672,7 +722,6 @@ export default function App() {
         .eq("move_started_at", st.move_started_at)
         .select();
 
-      // If 0 rows updated => someone else already finalized. That's fine.
       if (error) {
         console.warn("Finalize movement failed:", error);
         return;
@@ -684,7 +733,9 @@ export default function App() {
       if (cancelled) return;
 
       const nowMs = Date.now();
-      const moving = resourceStates.filter(x => x.status === "MOVING" && x.dest_lat != null && x.dest_lng != null && x.move_started_at);
+      const moving = resourceStates.filter(
+        x => x.status === "MOVING" && x.dest_lat != null && x.dest_lng != null && x.move_started_at
+      );
 
       for (const st of moving) {
         const marker = resourceMarkersRef.current.get(st.resource_id);
@@ -704,9 +755,7 @@ export default function App() {
         const pos = interpolateOnLine(route.line, route.cum, dist);
         marker.setLatLng(pos);
 
-        // arrived
         if (dist >= total - 3) {
-          // snap to destination and try finalize
           marker.setLatLng([st.dest_lat, st.dest_lng]);
           await maybeFinalize(st);
         }
