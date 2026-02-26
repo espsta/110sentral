@@ -50,7 +50,7 @@ const C = {
   alarmBorder: "rgba(248,113,113,0.55)",
 };
 
-const ARRIVE_THRESHOLD_METERS = 80; // når nærme punktet => "fremme"
+const ARRIVE_THRESHOLD_METERS = 80;
 
 function labelBoxHtml(text, tone = "normal") {
   const solved = tone === "solved";
@@ -160,7 +160,6 @@ function upsertByKey(prev, payload, keys) {
   return next;
 }
 
-// WebAudio alarm-beep
 function playAlarmBeep() {
   try {
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -192,7 +191,6 @@ function playAlarmBeep() {
   } catch {}
 }
 
-// ===== Routing (OSRM) + shared movement =====
 async function fetchRouteOSRM(fromLat, fromLng, toLat, toLng) {
   const url =
     `https://router.project-osrm.org/route/v1/driving/` +
@@ -203,9 +201,9 @@ async function fetchRouteOSRM(fromLat, fromLng, toLat, toLng) {
   if (!res.ok) throw new Error("OSRM route failed");
   const data = await res.json();
 
-  const coords = data?.routes?.[0]?.geometry?.coordinates; // [lng,lat]
+  const coords = data?.routes?.[0]?.geometry?.coordinates;
   if (!coords || coords.length < 2) throw new Error("No route geometry");
-  return coords.map(([lng, lat]) => [lat, lng]); // [lat,lng]
+  return coords.map(([lng, lat]) => [lat, lng]);
 }
 
 function haversineMeters(a, b) {
@@ -255,13 +253,8 @@ export default function App() {
   const incidentLayerRef = useRef(null);
   const searchLayerRef = useRef(null);
 
-  // Marker refs for resources (so we can animate)
-  const resourceMarkersRef = useRef(new Map()); // resource_id -> Leaflet Marker
-
-  // Route cache for movements (keyed by resource_id + move_started_at + dest)
-  const routeCacheRef = useRef(new Map()); // key -> { line, cum, total }
-
-  // active animation handles
+  const resourceMarkersRef = useRef(new Map());
+  const routeCacheRef = useRef(new Map());
   const animHandleRef = useRef(null);
 
   const [sessionId, setSessionId] = useState(null);
@@ -287,12 +280,10 @@ export default function App() {
   const [author, setAuthor] = useState("");
   const [logText, setLogText] = useState("");
 
-  // Instruktør / ABA
   const [isInstructor, setIsInstructor] = useState(() => localStorage.getItem("isInstructor") === "1");
-  const [abaAddress, setAbaAddress] = useState(""); // adresse (påkrevd)
-  const [abaObjectName, setAbaObjectName] = useState(""); // objektnavn (valgfritt)
+  const [abaAddress, setAbaAddress] = useState("");
+  const [abaObjectName, setAbaObjectName] = useState("");
 
-  // Search (adresse felt delt i 3)
   const [addrStreet, setAddrStreet] = useState("");
   const [addrNo, setAddrNo] = useState("");
   const [addrMunicipality, setAddrMunicipality] = useState("");
@@ -369,7 +360,6 @@ export default function App() {
     return /norge|norway/i.test(mid) ? mid : `${mid}, Norge`;
   };
 
-  // Felles geokoding (Nominatim)
   const geocodeAddress = async (rawOrParts, limit = 1) => {
     const raw = typeof rawOrParts === "string"
       ? rawOrParts
@@ -402,7 +392,6 @@ export default function App() {
     }));
   };
 
-  // beregn nå-posisjon for MOVING ressurs (for omdirigering)
   const getCurrentMovingPosition = async (st) => {
     const t0 = parseTs(st.move_started_at);
     if (!t0) return null;
@@ -447,7 +436,7 @@ export default function App() {
     if (!station) return false;
     if (st.dest_lat == null || st.dest_lng == null) return false;
     const d = haversineMeters([st.dest_lat, st.dest_lng], [station.lat, station.lng]);
-    return d <= 60; // dest ~ stasjon
+    return d <= 60;
   };
 
   // ===== Session bootstrap + realtime =====
@@ -483,7 +472,6 @@ export default function App() {
       setSessionId(sid);
       setStatusMsg(`Økt: ${code}`);
 
-      // Seed resource states
       const seed = resourcesMaster.map((r) => ({
         session_id: sid,
         resource_id: r.id,
@@ -550,6 +538,7 @@ export default function App() {
   }, [incidents]);
 
   // ===== Map init (stations always visible) =====
+  // ✅ FIKS: KUN sessionId her (ikke resourceStates), ellers resettes kartet ved hver ressursendring
   useEffect(() => {
     if (!mapDivRef.current) return;
     if (mapRef.current) return;
@@ -572,7 +561,6 @@ export default function App() {
         .addTo(stationLayerRef.current);
     });
 
-    // Click: create incident OR move resource (shared movement)
     map.on("click", async (e) => {
       if (!sessionId) return;
 
@@ -660,9 +648,9 @@ export default function App() {
       map.remove();
       mapRef.current = null;
     };
-  }, [sessionId, resourceStates]); // (beholder samme som før her)
+  }, [sessionId]); // ✅ HER er den viktige endringen
 
-  // ===== Create / update resource markers (do NOT animate here) =====
+  // ===== Create / update resource markers =====
   useEffect(() => {
     if (!resourceLayerRef.current) return;
 
@@ -724,7 +712,7 @@ export default function App() {
     });
   }, [incidents]);
 
-  // ===== Shared movement animator loop (ALL clients) =====
+  // ===== Shared movement animator loop =====
   useEffect(() => {
     let cancelled = false;
 
@@ -830,15 +818,10 @@ export default function App() {
         const pos = interpolateOnLine(route.line, route.cum, dist);
         marker.setLatLng(pos);
 
-        // ENDRET: "fremme" når nærme => finalize tidligere
         if (dist >= Math.max(0, total - ARRIVE_THRESHOLD_METERS)) {
           marker.setLatLng([st.dest_lat, st.dest_lng]);
-
-          if (isReturnToStationMove(st)) {
-            await finalizeAsOnStation(st);
-          } else {
-            await finalizeAsDeployed(st);
-          }
+          if (isReturnToStationMove(st)) await finalizeAsOnStation(st);
+          else await finalizeAsDeployed(st);
         }
       }
 
@@ -867,16 +850,11 @@ export default function App() {
     let fromLat = null;
     let fromLng = null;
 
-    // 1) Hvis MOVING: start der den faktisk er nå
     if (current?.status === "MOVING") {
       const pos = await getCurrentMovingPosition(current);
-      if (pos) {
-        fromLat = pos[0];
-        fromLng = pos[1];
-      }
+      if (pos) { fromLat = pos[0]; fromLng = pos[1]; }
     }
 
-    // 2) Ellers: hvis marker finnes, bruk den
     if (fromLat == null || fromLng == null) {
       if (marker) {
         const ll = marker.getLatLng();
@@ -885,21 +863,15 @@ export default function App() {
       }
     }
 
-    // 3) Ellers: DB posisjon
     if ((fromLat == null || fromLng == null) && current?.lat != null && current?.lng != null) {
       fromLat = current.lat;
       fromLng = current.lng;
     }
 
-    // 4) Ellers: stasjon
     if (fromLat == null || fromLng == null) {
       fromLat = station.lat;
       fromLng = station.lng;
     }
-
-    const toLat = station.lat;
-    const toLng = station.lng;
-    const speedMps = 20.0;
 
     await supabase
       .from("resource_states")
@@ -907,10 +879,10 @@ export default function App() {
         status: "MOVING",
         start_lat: fromLat,
         start_lng: fromLng,
-        dest_lat: toLat,
-        dest_lng: toLng,
+        dest_lat: station.lat,
+        dest_lng: station.lng,
         move_started_at: new Date().toISOString(),
-        speed_mps: speedMps,
+        speed_mps: 20.0,
         lat: fromLat,
         lng: fromLng,
       })
@@ -949,7 +921,6 @@ export default function App() {
     return true;
   };
 
-  // ABA krever konkret adresse (geokodes)
   const generateABA = async () => {
     if (!sessionId) {
       alert("Venter på økt… prøv igjen.");
@@ -964,11 +935,7 @@ export default function App() {
     }
 
     let hit = null;
-    try {
-      hit = await geocodeAddress(addr, 1);
-    } catch {
-      hit = null;
-    }
+    try { hit = await geocodeAddress(addr, 1); } catch { hit = null; }
     if (!hit) {
       alert("Fant ikke adressen. Prøv mer presist (gate + nummer + sted).");
       return;
@@ -995,7 +962,6 @@ export default function App() {
     zoomTo(hit.lat, hit.lng, 13);
   };
 
-  // ===== Search (Nominatim) =====
   const runSearch = async () => {
     const query = buildAddressQuery({ street: addrStreet, number: addrNo, municipality: addrMunicipality });
     if (!query) return;
@@ -1007,9 +973,7 @@ export default function App() {
     try {
       const cleaned = await geocodeAddress(query, 10);
       setResults(cleaned || []);
-      if (!cleaned || cleaned.length === 0) {
-        setSearchError("Fant ingen treff. Prøv mer presist (gate + nummer + kommune).");
-      }
+      if (!cleaned || cleaned.length === 0) setSearchError("Fant ingen treff. Prøv mer presist (gate + nummer + kommune).");
     } catch {
       setSearchError("Søk feilet (nett/proxy eller rate limit).");
     } finally {
@@ -1037,11 +1001,10 @@ export default function App() {
       cursor: "pointer",
     };
 
-    // default: ledig på stasjon
     if (!state || state.status === "ON_STATION") {
       return {
-        wrapBg: "rgba(34,197,94,0.85)",      // grønn
-        wrapColor: "rgba(255,255,255,0.95)", // hvit tekst
+        wrapBg: "rgba(34,197,94,0.85)",
+        wrapColor: "rgba(255,255,255,0.95)",
         btnBg: "transparent",
         btnColor: "inherit",
         base,
@@ -1050,11 +1013,10 @@ export default function App() {
     }
 
     const returning = state.status === "MOVING" && isReturnToStationMove(state);
-
     if (returning) {
       return {
-        wrapBg: "rgba(34,197,94,0.85)",      // grønn
-        wrapColor: "rgba(17,24,39,0.95)",    // sort tekst
+        wrapBg: "rgba(34,197,94,0.85)",
+        wrapColor: "rgba(17,24,39,0.95)",
         btnBg: "transparent",
         btnColor: "inherit",
         base,
@@ -1064,8 +1026,8 @@ export default function App() {
 
     if (state.status === "MOVING") {
       return {
-        wrapBg: "rgba(220,38,38,0.85)",      // rød
-        wrapColor: "rgba(255,255,255,0.95)", // hvit tekst
+        wrapBg: "rgba(220,38,38,0.85)",
+        wrapColor: "rgba(255,255,255,0.95)",
         btnBg: "transparent",
         btnColor: "inherit",
         base,
@@ -1073,11 +1035,10 @@ export default function App() {
       };
     }
 
-    // DEPLOYED = fremme
     if (state.status === "DEPLOYED") {
       return {
-        wrapBg: "rgba(220,38,38,0.85)",       // rød rubrikk
-        wrapColor: "rgba(17,24,39,0.95)",     // sort tekst
+        wrapBg: "rgba(220,38,38,0.85)",
+        wrapColor: "rgba(17,24,39,0.95)",
         btnBg: "transparent",
         btnColor: "inherit",
         base,
@@ -1095,7 +1056,6 @@ export default function App() {
     };
   };
 
-  // ===== Render =====
   return (
     <div style={{
       height: "100vh",
@@ -1220,7 +1180,6 @@ export default function App() {
         position: "relative",
         height: "calc(100vh - 24px)",
       }}>
-        {/* Search */}
         <div style={{
           position: "absolute", zIndex: 800, top: 10, left: "50%",
           transform: "translateX(-50%)",
@@ -1277,7 +1236,6 @@ export default function App() {
             <button
               onClick={() => { setSelectedResourceId(null); setIncidentMode(v => !v); }}
               style={buttonStyle(incidentMode)}
-              title="Sett kartet i hendelsemodus"
             >
               Ny hendelse
             </button>
@@ -1320,7 +1278,6 @@ export default function App() {
           )}
         </div>
 
-        {/* Status */}
         <div style={{
           position: "absolute", zIndex: 700, top: 10, left: 10,
           padding: "8px 10px",
@@ -1341,7 +1298,6 @@ export default function App() {
 
       {/* RIGHT */}
       <div style={{ ...panelStyle, display: "flex", flexDirection: "column", gap: 12 }}>
-        {/* Instructor */}
         <div style={cardStyle}>
           <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
             <div style={{ fontWeight: 900 }}>Instruktør</div>
@@ -1408,7 +1364,6 @@ export default function App() {
           )}
         </div>
 
-        {/* Incidents */}
         <div style={{ flex: 1, overflow: "auto" }}>
           <div style={{ fontWeight: 900, fontSize: 16 }}>Hendelser</div>
           <div style={{ marginTop: 8, fontSize: 12, color: C.muted }}>
@@ -1523,7 +1478,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* ABA field */}
         <div style={{
           borderRadius: 14,
           border: `1px solid ${C.alarmBorder}`,
