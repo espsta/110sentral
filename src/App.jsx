@@ -8,23 +8,33 @@ const DEFAULT_ZOOM = 10;
 
 // --- Masterdata
 const stations = [
-  { id: "T1", name: "T1 Lørenskog", lat: 59.9326, lng: 10.9650 },
-  { id: "S1", name: "S1 Ski",      lat: 59.7195, lng: 10.8350 },
-  { id: "M1", name: "M1 Moss",     lat: 59.4370, lng: 10.6570 },
+  { id: "S1", name: "S1 Ski",         lat: 59.7195,    lng: 10.8350 },
+  { id: "S2", name: "S2 Oppegård",    lat: 59.79516,   lng: 10.8235 },
+  { id: "S3", name: "S3 Korsegården", lat: 59.6597191, lng: 10.7258981 },
+  { id: "M1", name: "M1 Moss",        lat: 59.4370,    lng: 10.6570 },
+  { id: "M2", name: "M2 Rygge",       lat: 59.394353,  lng: 10.732076 },
+  { id: "M3", name: "M3 Såner",       lat: 59.5305779, lng: 10.7505367 },
 ];
 
 const resourcesMaster = [
-  { id: "T11", callSign: "T11", type: "Mannskapsbil", stationId: "T1" },
-  { id: "T13", callSign: "T13", type: "Høyde",        stationId: "T1" },
-  { id: "T14", callSign: "T14", type: "Tankbil",      stationId: "T1" },
-
   { id: "S11", callSign: "S11", type: "Mannskapsbil", stationId: "S1" },
   { id: "S13", callSign: "S13", type: "Høyde",        stationId: "S1" },
   { id: "S14", callSign: "S14", type: "Tankbil",      stationId: "S1" },
 
+  { id: "S21", callSign: "S21", type: "Mannskapsbil", stationId: "S2" },
+
+  { id: "S31", callSign: "S31", type: "Mannskapsbil", stationId: "S3" },
+  { id: "S34", callSign: "S34", type: "Tankbil",      stationId: "S3" },
+
   { id: "M11", callSign: "M11", type: "Mannskapsbil", stationId: "M1" },
   { id: "M13", callSign: "M13", type: "Høyde",        stationId: "M1" },
   { id: "M14", callSign: "M14", type: "Tankbil",      stationId: "M1" },
+
+  { id: "M21", callSign: "M21", type: "Mannskapsbil", stationId: "M2" },
+  { id: "M24", callSign: "M24", type: "Tankbil",      stationId: "M2" },
+
+  { id: "M31", callSign: "M31", type: "Mannskapsbil", stationId: "M3" },
+  { id: "M34", callSign: "M34", type: "Tankbil",      stationId: "M3" },
 ];
 
 const C = {
@@ -350,7 +360,7 @@ export default function App() {
     if (!t0) return null;
 
     const nowMs = Date.now();
-    const speed = (st.speed_mps && Number(st.speed_mps) > 0) ? Number(st.speed_mps) : 16.7;
+    const speed = (st.speed_mps && Number(st.speed_mps) > 0) ? Number(st.speed_mps) : 20.0; // ~72 km/t (litt fortere)
     const elapsedSec = Math.max(0, (nowMs - t0) / 1000);
     const dist = elapsedSec * speed;
 
@@ -570,7 +580,7 @@ export default function App() {
 
       const toLat = e.latlng.lat;
       const toLng = e.latlng.lng;
-      const speedMps = 16.7; // ~60 km/t
+      const speedMps = 20.0; // ~72 km/t (litt fortere)
 
       const { error } = await supabase.from("resource_states").update({
         status: "MOVING",
@@ -744,7 +754,7 @@ export default function App() {
         const t0 = parseTs(st.move_started_at);
         if (!t0) continue;
 
-        const speed = (st.speed_mps && Number(st.speed_mps) > 0) ? Number(st.speed_mps) : 16.7;
+        const speed = (st.speed_mps && Number(st.speed_mps) > 0) ? Number(st.speed_mps) : 20.0; // litt fortere
         const elapsedSec = Math.max(0, (nowMs - t0) / 1000);
         const dist = elapsedSec * speed;
 
