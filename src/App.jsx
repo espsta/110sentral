@@ -50,6 +50,8 @@ const C = {
   alarmBorder: "rgba(248,113,113,0.55)",
 };
 
+const ARRIVE_THRESHOLD_METERS = 80; // når nærme punktet => "fremme"
+
 function labelBoxHtml(text, tone = "normal") {
   const solved = tone === "solved";
   return `
@@ -287,11 +289,13 @@ export default function App() {
 
   // Instruktør / ABA
   const [isInstructor, setIsInstructor] = useState(() => localStorage.getItem("isInstructor") === "1");
-  const [abaAddress, setAbaAddress] = useState(""); // NYTT: adresse (påkrevd)
-  const [abaObjectName, setAbaObjectName] = useState(""); // NYTT: objektnavn (valgfritt)
+  const [abaAddress, setAbaAddress] = useState(""); // adresse (påkrevd)
+  const [abaObjectName, setAbaObjectName] = useState(""); // objektnavn (valgfritt)
 
-  // Search
-  const [q, setQ] = useState("");
+  // Search (adresse felt delt i 3)
+  const [addrStreet, setAddrStreet] = useState("");
+  const [addrNo, setAddrNo] = useState("");
+  const [addrMunicipality, setAddrMunicipality] = useState("");
   const [searching, setSearching] = useState(false);
   const [results, setResults] = useState([]);
   const [searchError, setSearchError] = useState("");
@@ -355,35 +359,56 @@ export default function App() {
     mapRef.current.setView([lat, lng], z);
   };
 
-  // NYTT: felles geokoding (samme som adressesøket)
-  const geocodeAddress = async (raw) => {
+  const buildAddressQuery = ({ street, number, municipality }) => {
+    const s = (street || "").trim();
+    const n = (number || "").trim();
+    const m = (municipality || "").trim();
+    if (!s && !m) return "";
+    const left = [s, n].filter(Boolean).join(" ").trim();
+    const mid = [left, m].filter(Boolean).join(", ").trim();
+    return /norge|norway/i.test(mid) ? mid : `${mid}, Norge`;
+  };
+
+  // Felles geokoding (Nominatim)
+  const geocodeAddress = async (rawOrParts, limit = 1) => {
+    const raw = typeof rawOrParts === "string"
+      ? rawOrParts
+      : buildAddressQuery(rawOrParts);
+
     const q0 = (raw || "").trim();
     if (!q0) return null;
 
-    const query = /norge|norway/i.test(q0) ? q0 : `${q0}, Norge`;
     const viewbox = "10.0,59.0,11.8,60.3";
     const url =
       "https://nominatim.openstreetmap.org/search" +
-      "?format=jsonv2&limit=1&addressdetails=1&countrycodes=no" +
+      `?format=jsonv2&limit=${limit}&addressdetails=1&countrycodes=no` +
       "&viewbox=" + encodeURIComponent(viewbox) +
-      "&bounded=1&q=" + encodeURIComponent(query);
+      "&bounded=1&q=" + encodeURIComponent(q0);
 
     const res = await fetch(url, { headers: { Accept: "application/json", "Accept-Language": "no" } });
     if (!res.ok) throw new Error("Nominatim failed");
     const data = await res.json();
-    const hit = (data || [])[0];
-    if (!hit?.lat || !hit?.lon) return null;
 
-    return { lat: Number(hit.lat), lng: Number(hit.lon), display: hit.display_name || q0 };
+    if (limit === 1) {
+      const hit = (data || [])[0];
+      if (!hit?.lat || !hit?.lon) return null;
+      return { lat: Number(hit.lat), lng: Number(hit.lon), display: hit.display_name || q0 };
+    }
+
+    return (data || []).filter((x) => x.lat && x.lon).map((x) => ({
+      display_name: x.display_name,
+      lat: Number(x.lat),
+      lon: Number(x.lon),
+    }));
   };
 
-  // NYTT: beregn nå-posisjon for MOVING ressurs (for omdirigering)
+  // beregn nå-posisjon for MOVING ressurs (for omdirigering)
   const getCurrentMovingPosition = async (st) => {
     const t0 = parseTs(st.move_started_at);
     if (!t0) return null;
 
     const nowMs = Date.now();
-    const speed = (st.speed_mps && Number(st.speed_mps) > 0) ? Number(st.speed_mps) : 20.0; // ~72 km/t (litt fortere)
+    const speed = (st.speed_mps && Number(st.speed_mps) > 0) ? Number(st.speed_mps) : 20.0;
     const elapsedSec = Math.max(0, (nowMs - t0) / 1000);
     const dist = elapsedSec * speed;
 
@@ -414,6 +439,15 @@ export default function App() {
     }
 
     return interpolateOnLine(cached.line, cached.cum, dist);
+  };
+
+  const isReturnToStationMove = (st) => {
+    const master = resourcesMaster.find(x => x.id === st.resource_id);
+    const station = stations.find(s => s.id === master?.stationId);
+    if (!station) return false;
+    if (st.dest_lat == null || st.dest_lng == null) return false;
+    const d = haversineMeters([st.dest_lat, st.dest_lng], [station.lat, station.lng]);
+    return d <= 60; // dest ~ stasjon
   };
 
   // ===== Session bootstrap + realtime =====
@@ -516,7 +550,6 @@ export default function App() {
   }, [incidents]);
 
   // ===== Map init (stations always visible) =====
-  // ENDRET: denne skal kun kjøre på sessionId, ikke på resourceStates (hindrer “midstilling”)
   useEffect(() => {
     if (!mapDivRef.current) return;
     if (mapRef.current) return;
@@ -562,7 +595,6 @@ export default function App() {
       const rid = selectedResourceIdRef.current;
       if (!rid) return;
 
-      // ENDRET: Startposisjon skal være “der den er nå” hvis MOVING
       const current = resourceStates.find(x => x.resource_id === rid);
       const master = resourcesMaster.find(x => x.id === rid);
       const station = stations.find(s => s.id === master?.stationId);
@@ -571,16 +603,11 @@ export default function App() {
       let fromLat = null;
       let fromLng = null;
 
-      // 1) Hvis MOVING: start der den faktisk er nå
       if (current?.status === "MOVING") {
         const pos = await getCurrentMovingPosition(current);
-        if (pos) {
-          fromLat = pos[0];
-          fromLng = pos[1];
-        }
+        if (pos) { fromLat = pos[0]; fromLng = pos[1]; }
       }
 
-      // 2) Ellers: hvis marker finnes, bruk den
       if (fromLat == null || fromLng == null) {
         if (marker) {
           const ll = marker.getLatLng();
@@ -589,13 +616,11 @@ export default function App() {
         }
       }
 
-      // 3) Ellers: DB posisjon
       if ((fromLat == null || fromLng == null) && current?.lat != null && current?.lng != null) {
         fromLat = current.lat;
         fromLng = current.lng;
       }
 
-      // 4) Ellers: stasjon
       if (fromLat == null || fromLng == null) {
         fromLat = station?.lat ?? DEFAULT_CENTER[0];
         fromLng = station?.lng ?? DEFAULT_CENTER[1];
@@ -603,7 +628,7 @@ export default function App() {
 
       const toLat = e.latlng.lat;
       const toLng = e.latlng.lng;
-      const speedMps = 20.0; // ~72 km/t (litt fortere)
+      const speedMps = 20.0;
 
       const { error } = await supabase.from("resource_states").update({
         status: "MOVING",
@@ -635,7 +660,7 @@ export default function App() {
       map.remove();
       mapRef.current = null;
     };
-  }, [sessionId]);
+  }, [sessionId, resourceStates]); // (beholder samme som før her)
 
   // ===== Create / update resource markers (do NOT animate here) =====
   useEffect(() => {
@@ -735,8 +760,8 @@ export default function App() {
       }
     }
 
-    async function maybeFinalize(st) {
-      const { data, error } = await supabase
+    async function finalizeAsDeployed(st) {
+      const { error } = await supabase
         .from("resource_states")
         .update({
           status: "DEPLOYED",
@@ -752,14 +777,31 @@ export default function App() {
         .eq("session_id", st.session_id)
         .eq("resource_id", st.resource_id)
         .eq("status", "MOVING")
-        .eq("move_started_at", st.move_started_at)
-        .select();
+        .eq("move_started_at", st.move_started_at);
 
-      if (error) {
-        console.warn("Finalize movement failed:", error);
-        return;
-      }
-      return data;
+      if (error) console.warn("Finalize deployed failed:", error);
+    }
+
+    async function finalizeAsOnStation(st) {
+      const { error } = await supabase
+        .from("resource_states")
+        .update({
+          status: "ON_STATION",
+          lat: null,
+          lng: null,
+          start_lat: null,
+          start_lng: null,
+          dest_lat: null,
+          dest_lng: null,
+          move_started_at: null,
+          speed_mps: null,
+        })
+        .eq("session_id", st.session_id)
+        .eq("resource_id", st.resource_id)
+        .eq("status", "MOVING")
+        .eq("move_started_at", st.move_started_at);
+
+      if (error) console.warn("Finalize on-station failed:", error);
     }
 
     async function tick() {
@@ -788,9 +830,15 @@ export default function App() {
         const pos = interpolateOnLine(route.line, route.cum, dist);
         marker.setLatLng(pos);
 
-        if (dist >= total - 3) {
+        // ENDRET: "fremme" når nærme => finalize tidligere
+        if (dist >= Math.max(0, total - ARRIVE_THRESHOLD_METERS)) {
           marker.setLatLng([st.dest_lat, st.dest_lng]);
-          await maybeFinalize(st);
+
+          if (isReturnToStationMove(st)) {
+            await finalizeAsOnStation(st);
+          } else {
+            await finalizeAsDeployed(st);
+          }
         }
       }
 
@@ -809,14 +857,62 @@ export default function App() {
   const returnToStation = async (resourceId) => {
     if (!sessionId) return;
 
+    const current = resourceStates.find(x => x.resource_id === resourceId);
+    const master = resourcesMaster.find(x => x.id === resourceId);
+    const station = stations.find(s => s.id === master?.stationId);
+    const marker = resourceMarkersRef.current.get(resourceId);
+
+    if (!station) return;
+
+    let fromLat = null;
+    let fromLng = null;
+
+    // 1) Hvis MOVING: start der den faktisk er nå
+    if (current?.status === "MOVING") {
+      const pos = await getCurrentMovingPosition(current);
+      if (pos) {
+        fromLat = pos[0];
+        fromLng = pos[1];
+      }
+    }
+
+    // 2) Ellers: hvis marker finnes, bruk den
+    if (fromLat == null || fromLng == null) {
+      if (marker) {
+        const ll = marker.getLatLng();
+        fromLat = ll.lat;
+        fromLng = ll.lng;
+      }
+    }
+
+    // 3) Ellers: DB posisjon
+    if ((fromLat == null || fromLng == null) && current?.lat != null && current?.lng != null) {
+      fromLat = current.lat;
+      fromLng = current.lng;
+    }
+
+    // 4) Ellers: stasjon
+    if (fromLat == null || fromLng == null) {
+      fromLat = station.lat;
+      fromLng = station.lng;
+    }
+
+    const toLat = station.lat;
+    const toLng = station.lng;
+    const speedMps = 20.0;
+
     await supabase
       .from("resource_states")
       .update({
-        status: "ON_STATION",
-        lat: null, lng: null,
-        start_lat: null, start_lng: null,
-        dest_lat: null, dest_lng: null,
-        move_started_at: null, speed_mps: null,
+        status: "MOVING",
+        start_lat: fromLat,
+        start_lng: fromLng,
+        dest_lat: toLat,
+        dest_lng: toLng,
+        move_started_at: new Date().toISOString(),
+        speed_mps: speedMps,
+        lat: fromLat,
+        lng: fromLng,
       })
       .eq("session_id", sessionId)
       .eq("resource_id", resourceId);
@@ -853,7 +949,7 @@ export default function App() {
     return true;
   };
 
-  // ENDRET: ABA krever konkret adresse (geokodes)
+  // ABA krever konkret adresse (geokodes)
   const generateABA = async () => {
     if (!sessionId) {
       alert("Venter på økt… prøv igjen.");
@@ -869,7 +965,7 @@ export default function App() {
 
     let hit = null;
     try {
-      hit = await geocodeAddress(addr);
+      hit = await geocodeAddress(addr, 1);
     } catch {
       hit = null;
     }
@@ -901,34 +997,19 @@ export default function App() {
 
   // ===== Search (Nominatim) =====
   const runSearch = async () => {
-    const raw = q.trim();
-    if (!raw) return;
+    const query = buildAddressQuery({ street: addrStreet, number: addrNo, municipality: addrMunicipality });
+    if (!query) return;
 
-    const query = /norge|norway/i.test(raw) ? raw : `${raw}, Norge`;
     setSearching(true);
     setSearchError("");
     setResults([]);
 
     try {
-      const viewbox = "10.0,59.0,11.8,60.3";
-      const url =
-        "https://nominatim.openstreetmap.org/search" +
-        "?format=jsonv2&limit=10&addressdetails=1&countrycodes=no" +
-        "&viewbox=" + encodeURIComponent(viewbox) +
-        "&bounded=1&q=" + encodeURIComponent(query);
-
-      const res = await fetch(url, { headers: { Accept: "application/json", "Accept-Language": "no" } });
-      if (!res.ok) throw new Error();
-
-      const data = await res.json();
-      const cleaned = (data || []).filter((x) => x.lat && x.lon).map((x) => ({
-        display_name: x.display_name,
-        lat: Number(x.lat),
-        lon: Number(x.lon),
-      }));
-
-      setResults(cleaned);
-      if (cleaned.length === 0) setSearchError("Fant ingen treff. Prøv: 'Gatenavn nummer, sted' (f.eks. 'Storgata 10, Ski').");
+      const cleaned = await geocodeAddress(query, 10);
+      setResults(cleaned || []);
+      if (!cleaned || cleaned.length === 0) {
+        setSearchError("Fant ingen treff. Prøv mer presist (gate + nummer + kommune).");
+      }
     } catch {
       setSearchError("Søk feilet (nett/proxy eller rate limit).");
     } finally {
@@ -948,12 +1029,78 @@ export default function App() {
     }
   };
 
+  const getResourceUi = (state) => {
+    const base = {
+      border: `1px solid ${C.border}`,
+      borderRadius: 12,
+      padding: 10,
+      cursor: "pointer",
+    };
+
+    // default: ledig på stasjon
+    if (!state || state.status === "ON_STATION") {
+      return {
+        wrapBg: "rgba(34,197,94,0.85)",      // grønn
+        wrapColor: "rgba(255,255,255,0.95)", // hvit tekst
+        btnBg: "transparent",
+        btnColor: "inherit",
+        base,
+        statusLabel: "Ledig",
+      };
+    }
+
+    const returning = state.status === "MOVING" && isReturnToStationMove(state);
+
+    if (returning) {
+      return {
+        wrapBg: "rgba(34,197,94,0.85)",      // grønn
+        wrapColor: "rgba(17,24,39,0.95)",    // sort tekst
+        btnBg: "transparent",
+        btnColor: "inherit",
+        base,
+        statusLabel: "Ledig",
+      };
+    }
+
+    if (state.status === "MOVING") {
+      return {
+        wrapBg: "rgba(220,38,38,0.85)",      // rød
+        wrapColor: "rgba(255,255,255,0.95)", // hvit tekst
+        btnBg: "transparent",
+        btnColor: "inherit",
+        base,
+        statusLabel: "Rykker ut",
+      };
+    }
+
+    // DEPLOYED = fremme
+    if (state.status === "DEPLOYED") {
+      return {
+        wrapBg: "rgba(220,38,38,0.85)",       // rød rubrikk
+        wrapColor: "rgba(17,24,39,0.95)",     // sort tekst
+        btnBg: "transparent",
+        btnColor: "inherit",
+        base,
+        statusLabel: "Fremme",
+      };
+    }
+
+    return {
+      wrapBg: "rgba(255,255,255,0.03)",
+      wrapColor: C.text,
+      btnBg: "transparent",
+      btnColor: "inherit",
+      base,
+      statusLabel: "Ukjent",
+    };
+  };
+
   // ===== Render =====
   return (
     <div style={{
       height: "100vh",
       display: "grid",
-      gridTemplateColumns: "320px 1fr 520px", // ENDRET: venstre litt smalere
+      gridTemplateColumns: "320px 1fr 520px",
       gap: 12,
       padding: 12,
       background: C.bg,
@@ -991,42 +1138,62 @@ export default function App() {
                     {(resourcesByStation[s.id] || []).map((r) => {
                       const state = resourceStates.find((x) => x.resource_id === r.id);
                       const isPlaced = state?.status === "DEPLOYED" || state?.status === "MOVING";
-                      const isMoving = state?.status === "MOVING";
                       const isSelected = selectedResourceId === r.id;
 
+                      const ui = getResourceUi(state);
+
                       return (
-                        <div key={r.id} style={{ display:"flex", gap:8, alignItems:"stretch" }}>
+                        <div
+                          key={r.id}
+                          style={{
+                            display: "flex",
+                            gap: 8,
+                            alignItems: "stretch",
+                            borderRadius: 12,
+                            background: ui.wrapBg,
+                            color: ui.wrapColor,
+                            border: `1px solid ${C.border}`,
+                            padding: 8,
+                          }}
+                        >
                           <button
                             onClick={() => {
                               setIncidentMode(false);
                               setSelectedResourceId(isSelected ? null : r.id);
                             }}
                             style={{
-                              flex: 1, textAlign: "left",
-                              borderRadius: 12, padding: 10,
-                              border: `1px solid ${C.border}`,
-                              background: isSelected ? "rgba(147,197,253,0.12)" : "rgba(255,255,255,0.03)",
-                              color: C.text, cursor: "pointer",
+                              flex: 1,
+                              textAlign: "left",
+                              ...ui.base,
+                              border: "none",
+                              background: ui.btnBg,
+                              color: ui.btnColor,
+                              padding: 0,
                             }}
                           >
                             <div style={{ fontWeight: 900 }}>
                               {r.callSign}{" "}
-                              <span style={{ fontWeight: 700, color: C.muted, fontSize: 12 }}>({r.type})</span>
+                              <span style={{ fontWeight: 800, fontSize: 12, opacity: 0.9 }}>
+                                ({r.type})
+                              </span>
                             </div>
-                            <div style={{ fontSize: 12, color: C.muted }}>
-                              {isMoving ? "Status: På vei" : isPlaced ? "Status: Ute" : "Status: På stasjon"}
+                            <div style={{ fontSize: 12, fontWeight: 900, opacity: 0.9 }}>
+                              Status: {ui.statusLabel}
                             </div>
                           </button>
 
                           {isPlaced && (
                             <button
                               onClick={() => returnToStation(r.id)}
-                              title="Tilbake til stasjon"
+                              title="Tilbake til stasjon (kjører tilbake)"
                               style={{
-                                width: 52, borderRadius: 12,
+                                width: 52,
+                                borderRadius: 12,
                                 border: `1px solid ${C.border}`,
-                                background: "rgba(255,255,255,0.03)",
-                                color: C.text, cursor: "pointer", fontWeight: 900,
+                                background: "rgba(0,0,0,0.12)",
+                                color: ui.wrapColor,
+                                cursor: "pointer",
+                                fontWeight: 900,
                               }}
                             >
                               ↩
@@ -1057,31 +1224,56 @@ export default function App() {
         <div style={{
           position: "absolute", zIndex: 800, top: 10, left: "50%",
           transform: "translateX(-50%)",
-          width: "min(720px, calc(100% - 24px))", // litt bredere for knapp + søk
+          width: "min(900px, calc(100% - 24px))",
         }}>
           <div style={{
             display: "flex", gap: 8, padding: 10,
             borderRadius: 14, border: `1px solid ${C.border}`,
             background: "rgba(15,23,42,0.92)",
             boxShadow: "0 10px 28px rgba(0,0,0,0.45)",
+            alignItems: "center",
           }}>
             <input
-              value={q}
-              onChange={(e) => setQ(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") runSearch();
-                if (e.key === "Escape") setResults([]);
-              }}
-              placeholder="Søk adresse (f.eks. 'Storgata 10, Ski')"
+              value={addrStreet}
+              onChange={(e) => setAddrStreet(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") runSearch(); if (e.key === "Escape") setResults([]); }}
+              placeholder="Adresse (gate)"
               style={{
-                flex: 1, borderRadius: 12,
+                flex: 1,
+                borderRadius: 12,
+                border: `1px solid ${C.border}`,
+                background: "rgba(255,255,255,0.03)",
+                color: C.text, padding: "10px 12px", outline: "none",
+                minWidth: 180,
+              }}
+            />
+            <input
+              value={addrNo}
+              onChange={(e) => setAddrNo(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") runSearch(); if (e.key === "Escape") setResults([]); }}
+              placeholder="Nr"
+              style={{
+                width: 90,
+                borderRadius: 12,
+                border: `1px solid ${C.border}`,
+                background: "rgba(255,255,255,0.03)",
+                color: C.text, padding: "10px 12px", outline: "none",
+              }}
+            />
+            <input
+              value={addrMunicipality}
+              onChange={(e) => setAddrMunicipality(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") runSearch(); if (e.key === "Escape") setResults([]); }}
+              placeholder="Kommune"
+              style={{
+                width: 200,
+                borderRadius: 12,
                 border: `1px solid ${C.border}`,
                 background: "rgba(255,255,255,0.03)",
                 color: C.text, padding: "10px 12px", outline: "none",
               }}
             />
 
-            {/* ENDRET: Ny hendelse-knappen flyttet hit */}
             <button
               onClick={() => { setSelectedResourceId(null); setIncidentMode(v => !v); }}
               style={buttonStyle(incidentMode)}
@@ -1171,7 +1363,6 @@ export default function App() {
 
           {isInstructor && (
             <div style={{ marginTop: 10, display:"flex", flexDirection:"column", gap: 8 }}>
-              {/* NYTT: ABA-adresse (påkrevd) */}
               <input
                 value={abaAddress}
                 onChange={(e) => setAbaAddress(e.target.value)}
@@ -1187,7 +1378,6 @@ export default function App() {
                 }}
               />
 
-              {/* NYTT: objektnavn (valgfritt) */}
               <input
                 value={abaObjectName}
                 onChange={(e) => setAbaObjectName(e.target.value)}
@@ -1212,7 +1402,7 @@ export default function App() {
               </button>
 
               <div style={{ fontSize: 12, color: C.muted }}>
-                Krever adresse (geokodes som adressesøket). Objektnavn er valgfritt.
+                Krever adresse (geokodes). Objektnavn er valgfritt.
               </div>
             </div>
           )}
