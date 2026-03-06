@@ -51,6 +51,7 @@ const C = {
 };
 
 const ARRIVE_THRESHOLD_METERS = 80;
+const INCIDENT_ASSIGN_RADIUS_METERS = 300;
 
 function labelBoxHtml(text, tone = "normal") {
   const solved = tone === "solved";
@@ -405,7 +406,18 @@ export default function App() {
     if (!res.ok) throw new Error("Reverse geocoding failed");
 
     const data = await res.json();
-    return data?.display_name || "";
+    const addr = data?.address || {};
+    const road = addr.road || addr.pedestrian || addr.footway || addr.path || addr.cycleway || "";
+    const houseNumber = addr.house_number || "";
+    const suburb = addr.suburb || addr.city_district || addr.village || addr.town || addr.city || addr.municipality || "";
+    const municipality = addr.municipality || addr.city || addr.town || addr.village || "";
+    const parts = [
+      [road, houseNumber].filter(Boolean).join(" ").trim(),
+      suburb && suburb !== municipality ? suburb : "",
+      municipality,
+    ].filter(Boolean);
+
+    return parts.join(", ") || data?.display_name || "";
   };
 
   const getCurrentMovingPosition = async (st) => {
@@ -455,24 +467,39 @@ export default function App() {
     return d <= 60;
   };
 
+  const findIncidentForResourceState = (st) => {
+    if (!st) return null;
+    if (st.status !== "MOVING" && st.status !== "DEPLOYED") return null;
+    if (st.status === "MOVING" && isReturnToStationMove(st)) return null;
+
+    let best = null;
+    let bestDist = Infinity;
+
+    for (const incident of incidents) {
+      let d = Infinity;
+
+      if (st.status === "MOVING" && st.dest_lat != null && st.dest_lng != null) {
+        d = haversineMeters([st.dest_lat, st.dest_lng], [incident.lat, incident.lng]);
+      } else if (st.status === "DEPLOYED" && st.lat != null && st.lng != null) {
+        d = haversineMeters([st.lat, st.lng], [incident.lat, incident.lng]);
+      }
+
+      if (d <= INCIDENT_ASSIGN_RADIUS_METERS && d < bestDist) {
+        best = incident;
+        bestDist = d;
+      }
+    }
+
+    return best;
+  };
+
   const getResourcesForIncident = (incident) => {
     if (!incident) return [];
 
     return resourceStates
       .filter((st) => {
-        if (!st) return false;
-        if (st.status !== "MOVING" && st.status !== "DEPLOYED") return false;
-        if (st.status === "MOVING" && isReturnToStationMove(st)) return false;
-
-        if (st.status === "MOVING" && st.dest_lat != null && st.dest_lng != null) {
-          return haversineMeters([st.dest_lat, st.dest_lng], [incident.lat, incident.lng]) <= 120;
-        }
-
-        if (st.status === "DEPLOYED" && st.lat != null && st.lng != null) {
-          return haversineMeters([st.lat, st.lng], [incident.lat, incident.lng]) <= 120;
-        }
-
-        return false;
+        const linked = findIncidentForResourceState(st);
+        return linked?.id === incident.id;
       })
       .map((st) => ({
         resourceId: st.resource_id,
@@ -493,6 +520,66 @@ export default function App() {
       : "";
 
     return `${baseTitle}${address ? ` – ${address}` : ""}${resourceText}`;
+  };
+
+  const startResourceMovement = async (rid, toLat, toLng) => {
+    if (!sessionId || !rid) return;
+
+    const current = resourceStates.find((x) => x.resource_id === rid);
+    const master = resourcesMaster.find((x) => x.id === rid);
+    const station = stations.find((s) => s.id === master?.stationId);
+    const marker = resourceMarkersRef.current.get(rid);
+
+    let fromLat = null;
+    let fromLng = null;
+
+    if (current?.status === "MOVING") {
+      const pos = await getCurrentMovingPosition(current);
+      if (pos) {
+        fromLat = pos[0];
+        fromLng = pos[1];
+      }
+    }
+
+    if (fromLat == null || fromLng == null) {
+      if (marker) {
+        const ll = marker.getLatLng();
+        fromLat = ll.lat;
+        fromLng = ll.lng;
+      }
+    }
+
+    if ((fromLat == null || fromLng == null) && current?.lat != null && current?.lng != null) {
+      fromLat = current.lat;
+      fromLng = current.lng;
+    }
+
+    if (fromLat == null || fromLng == null) {
+      fromLat = station?.lat ?? DEFAULT_CENTER[0];
+      fromLng = station?.lng ?? DEFAULT_CENTER[1];
+    }
+
+    const speedMps = 20.0;
+
+    const { error } = await supabase.from("resource_states").update({
+      status: "MOVING",
+      start_lat: fromLat,
+      start_lng: fromLng,
+      dest_lat: toLat,
+      dest_lng: toLng,
+      move_started_at: new Date().toISOString(),
+      speed_mps: speedMps,
+      lat: fromLat,
+      lng: fromLng,
+    }).eq("session_id", sessionId).eq("resource_id", rid);
+
+    if (error) {
+      console.error("Start movement failed:", error);
+      alert(`Kunne ikke starte bevegelse: ${error.message}`);
+      return;
+    }
+
+    setSelectedResourceId(null);
   };
 
   // ===== Session bootstrap + realtime =====
@@ -579,10 +666,8 @@ export default function App() {
     })();
   }, []);
 
-  // Alarmlyd ved ny ABA
-  const seenIncidentIdsRef = useRef(new Set());
   useEffect(() => {
-    const seen = seenIncidentIdsRef.current;
+    const seen = new Set();
     for (const it of incidents) {
       if (!it?.id) continue;
       if (seen.has(it.id)) continue;
@@ -593,7 +678,6 @@ export default function App() {
     }
   }, [incidents]);
 
-  // Reverse geocode incident addresses
   useEffect(() => {
     let cancelled = false;
 
@@ -670,60 +754,23 @@ export default function App() {
       const rid = selectedResourceIdRef.current;
       if (!rid) return;
 
-      const current = resourceStates.find((x) => x.resource_id === rid);
-      const master = resourcesMaster.find((x) => x.id === rid);
-      const station = stations.find((s) => s.id === master?.stationId);
-      const marker = resourceMarkersRef.current.get(rid);
+      let chosenIncident = null;
+      let bestDist = Infinity;
 
-      let fromLat = null;
-      let fromLng = null;
-
-      if (current?.status === "MOVING") {
-        const pos = await getCurrentMovingPosition(current);
-        if (pos) { fromLat = pos[0]; fromLng = pos[1]; }
-      }
-
-      if (fromLat == null || fromLng == null) {
-        if (marker) {
-          const ll = marker.getLatLng();
-          fromLat = ll.lat;
-          fromLng = ll.lng;
+      for (const incident of incidents.filter((x) => !x.solved)) {
+        const d = haversineMeters([e.latlng.lat, e.latlng.lng], [incident.lat, incident.lng]);
+        if (d <= INCIDENT_ASSIGN_RADIUS_METERS && d < bestDist) {
+          chosenIncident = incident;
+          bestDist = d;
         }
       }
 
-      if ((fromLat == null || fromLng == null) && current?.lat != null && current?.lng != null) {
-        fromLat = current.lat;
-        fromLng = current.lng;
-      }
-
-      if (fromLat == null || fromLng == null) {
-        fromLat = station?.lat ?? DEFAULT_CENTER[0];
-        fromLng = station?.lng ?? DEFAULT_CENTER[1];
-      }
-
-      const toLat = e.latlng.lat;
-      const toLng = e.latlng.lng;
-      const speedMps = 20.0;
-
-      const { error } = await supabase.from("resource_states").update({
-        status: "MOVING",
-        start_lat: fromLat,
-        start_lng: fromLng,
-        dest_lat: toLat,
-        dest_lng: toLng,
-        move_started_at: new Date().toISOString(),
-        speed_mps: speedMps,
-        lat: fromLat,
-        lng: fromLng,
-      }).eq("session_id", sessionId).eq("resource_id", rid);
-
-      if (error) {
-        console.error("Start movement failed:", error);
-        alert(`Kunne ikke starte bevegelse: ${error.message}`);
+      if (chosenIncident) {
+        await startResourceMovement(rid, chosenIncident.lat, chosenIncident.lng);
         return;
       }
 
-      setSelectedResourceId(null);
+      await startResourceMovement(rid, e.latlng.lat, e.latlng.lng);
     });
 
     setTimeout(() => map.invalidateSize(), 120);
@@ -735,7 +782,7 @@ export default function App() {
       map.remove();
       mapRef.current = null;
     };
-  }, [sessionId]);
+  }, [sessionId, incidents, resourceStates]);
 
   // ===== Resource markers =====
   useEffect(() => {
@@ -792,9 +839,20 @@ export default function App() {
 
     incidents.forEach((h) => {
       const title = getIncidentHeadingText(h);
+
+      const group = L.layerGroup().addTo(incidentLayerRef.current);
+
+      L.circleMarker([h.lat, h.lng], {
+        radius: 18,
+        stroke: false,
+        fill: true,
+        fillOpacity: 0.001,
+        interactive: true,
+      }).addTo(group);
+
       L.marker([h.lat, h.lng], { icon: makeIncidentIcon(title, h.solved), interactive: true, zIndexOffset: 2200 })
         .bindPopup(`<b>${title}</b><br/>Status: ${h.solved ? "Løst" : "Aktiv"}`)
-        .addTo(incidentLayerRef.current);
+        .addTo(group);
     });
   }, [incidents, incidentAddressMap, resourceStates]);
 
@@ -1048,11 +1106,6 @@ export default function App() {
       return;
     }
 
-    setIncidentAddressMap((prev) => ({
-      ...prev,
-      [`tmp-${Date.now()}`]: "",
-    }));
-
     zoomTo(hit.lat, hit.lng, 13);
   };
 
@@ -1165,7 +1218,6 @@ export default function App() {
       background: C.bg,
       fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
     }}>
-      {/* LEFT */}
       <div style={panelStyle}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
           <div style={{ fontWeight: 900, fontSize: 16 }}>Brannressurser</div>
@@ -1275,7 +1327,6 @@ export default function App() {
         </div>
       </div>
 
-      {/* CENTER MAP */}
       <div style={{
         background: C.panel,
         borderRadius: 14,
@@ -1421,7 +1472,6 @@ export default function App() {
         <div ref={mapDivRef} style={{ height: "100%", width: "100%" }} />
       </div>
 
-      {/* RIGHT */}
       <div style={{ ...panelStyle, display: "flex", flexDirection: "column", gap: 12 }}>
         <div style={cardStyle}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
