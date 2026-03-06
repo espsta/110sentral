@@ -67,7 +67,7 @@ function labelBoxHtml(text, tone = "normal") {
       box-shadow:0 1px 6px rgba(0,0,0,0.25);
       margin-bottom:4px;
       white-space:nowrap;
-      max-width: 260px;
+      max-width: 320px;
       overflow:hidden;
       text-overflow:ellipsis;
     ">${text}</div>
@@ -291,6 +291,8 @@ export default function App() {
   const [results, setResults] = useState([]);
   const [searchError, setSearchError] = useState("");
 
+  const [incidentAddressMap, setIncidentAddressMap] = useState({});
+
   useEffect(() => { selectedResourceIdRef.current = selectedResourceId; }, [selectedResourceId]);
   useEffect(() => { incidentModeRef.current = incidentMode; }, [incidentMode]);
 
@@ -298,7 +300,7 @@ export default function App() {
     const grouped = {};
     for (const s of stations) grouped[s.id] = [];
     for (const r of resourcesMaster) grouped[r.stationId].push(r);
-    for (const k of Object.keys(grouped)) grouped[k].sort((a,b)=>a.callSign.localeCompare(b.callSign, "no"));
+    for (const k of Object.keys(grouped)) grouped[k].sort((a, b) => a.callSign.localeCompare(b.callSign, "no"));
     return grouped;
   }, []);
 
@@ -333,7 +335,7 @@ export default function App() {
     padding: 10,
     background: C.card,
   };
-  const buttonStyle = (active=false) => ({
+  const buttonStyle = (active = false) => ({
     border: `1px solid ${C.border}`,
     background: active ? "rgba(147,197,253,0.12)" : C.card,
     color: C.text,
@@ -392,6 +394,20 @@ export default function App() {
     }));
   };
 
+  const reverseGeocode = async (lat, lng) => {
+    const url =
+      "https://nominatim.openstreetmap.org/reverse" +
+      `?format=jsonv2&lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lng)}&zoom=18&addressdetails=1`;
+
+    const res = await fetch(url, {
+      headers: { Accept: "application/json", "Accept-Language": "no" },
+    });
+    if (!res.ok) throw new Error("Reverse geocoding failed");
+
+    const data = await res.json();
+    return data?.display_name || "";
+  };
+
   const getCurrentMovingPosition = async (st) => {
     const t0 = parseTs(st.move_started_at);
     if (!t0) return null;
@@ -431,12 +447,52 @@ export default function App() {
   };
 
   const isReturnToStationMove = (st) => {
-    const master = resourcesMaster.find(x => x.id === st.resource_id);
-    const station = stations.find(s => s.id === master?.stationId);
+    const master = resourcesMaster.find((x) => x.id === st.resource_id);
+    const station = stations.find((s) => s.id === master?.stationId);
     if (!station) return false;
     if (st.dest_lat == null || st.dest_lng == null) return false;
     const d = haversineMeters([st.dest_lat, st.dest_lng], [station.lat, station.lng]);
     return d <= 60;
+  };
+
+  const getResourcesForIncident = (incident) => {
+    if (!incident) return [];
+
+    return resourceStates
+      .filter((st) => {
+        if (!st) return false;
+        if (st.status !== "MOVING" && st.status !== "DEPLOYED") return false;
+        if (st.status === "MOVING" && isReturnToStationMove(st)) return false;
+
+        if (st.status === "MOVING" && st.dest_lat != null && st.dest_lng != null) {
+          return haversineMeters([st.dest_lat, st.dest_lng], [incident.lat, incident.lng]) <= 120;
+        }
+
+        if (st.status === "DEPLOYED" && st.lat != null && st.lng != null) {
+          return haversineMeters([st.lat, st.lng], [incident.lat, incident.lng]) <= 120;
+        }
+
+        return false;
+      })
+      .map((st) => ({
+        resourceId: st.resource_id,
+        callSign: st.call_sign,
+        status: st.status === "MOVING" ? "På vei" : "Fremme",
+      }))
+      .sort((a, b) => a.callSign.localeCompare(b.callSign, "no"));
+  };
+
+  const getIncidentHeadingText = (incident) => {
+    const isABA = (incident.title || "").trim().toUpperCase() === "ABA";
+    const baseTitle = isABA ? `ABA${incident.source ? ` – ${incident.source}` : ""}` : incident.title;
+
+    const address = incidentAddressMap[incident.id]?.trim();
+    const resources = getResourcesForIncident(incident);
+    const resourceText = resources.length > 0
+      ? ` • ${resources.map((r) => r.callSign).join(", ")}`
+      : "";
+
+    return `${baseTitle}${address ? ` – ${address}` : ""}${resourceText}`;
   };
 
   // ===== Session bootstrap + realtime =====
@@ -537,8 +593,39 @@ export default function App() {
     }
   }, [incidents]);
 
-  // ===== Map init (stations always visible) =====
-  // ✅ FIKS: KUN sessionId her (ikke resourceStates), ellers resettes kartet ved hver ressursendring
+  // Reverse geocode incident addresses
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      const missing = incidents.filter(
+        (h) => h?.id && h.lat != null && h.lng != null && !incidentAddressMap[h.id]
+      );
+
+      if (missing.length === 0) return;
+
+      for (const h of missing) {
+        try {
+          const addr = await reverseGeocode(h.lat, h.lng);
+          if (cancelled) return;
+          setIncidentAddressMap((prev) => ({
+            ...prev,
+            [h.id]: addr || "",
+          }));
+        } catch {
+          if (cancelled) return;
+          setIncidentAddressMap((prev) => ({
+            ...prev,
+            [h.id]: "",
+          }));
+        }
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [incidents, incidentAddressMap]);
+
+  // ===== Map init =====
   useEffect(() => {
     if (!mapDivRef.current) return;
     if (mapRef.current) return;
@@ -583,9 +670,9 @@ export default function App() {
       const rid = selectedResourceIdRef.current;
       if (!rid) return;
 
-      const current = resourceStates.find(x => x.resource_id === rid);
-      const master = resourcesMaster.find(x => x.id === rid);
-      const station = stations.find(s => s.id === master?.stationId);
+      const current = resourceStates.find((x) => x.resource_id === rid);
+      const master = resourcesMaster.find((x) => x.id === rid);
+      const station = stations.find((s) => s.id === master?.stationId);
       const marker = resourceMarkersRef.current.get(rid);
 
       let fromLat = null;
@@ -648,9 +735,9 @@ export default function App() {
       map.remove();
       mapRef.current = null;
     };
-  }, [sessionId]); // ✅ HER er den viktige endringen
+  }, [sessionId]);
 
-  // ===== Create / update resource markers =====
+  // ===== Resource markers =====
   useEffect(() => {
     if (!resourceLayerRef.current) return;
 
@@ -658,7 +745,7 @@ export default function App() {
     const mapMarkers = resourceMarkersRef.current;
 
     for (const [rid, m] of mapMarkers.entries()) {
-      const st = resourceStates.find(x => x.resource_id === rid);
+      const st = resourceStates.find((x) => x.resource_id === rid);
       if (!st || st.status === "ON_STATION") {
         layer.removeLayer(m);
         mapMarkers.delete(rid);
@@ -673,12 +760,13 @@ export default function App() {
       let lng = st.lng;
 
       if ((lat == null || lng == null) && st.status === "MOVING" && st.start_lat != null && st.start_lng != null) {
-        lat = st.start_lat; lng = st.start_lng;
+        lat = st.start_lat;
+        lng = st.start_lng;
       }
 
       if (lat == null || lng == null) {
-        const master = resourcesMaster.find(x => x.id === st.resource_id);
-        const station = stations.find(s => s.id === master?.stationId);
+        const master = resourcesMaster.find((x) => x.id === st.resource_id);
+        const station = stations.find((s) => s.id === master?.stationId);
         lat = station?.lat ?? DEFAULT_CENTER[0];
         lng = station?.lng ?? DEFAULT_CENTER[1];
       }
@@ -703,14 +791,12 @@ export default function App() {
     incidentLayerRef.current.clearLayers();
 
     incidents.forEach((h) => {
-      const isABA = (h.title || "").trim().toUpperCase() === "ABA";
-      const title = isABA ? `ABA${h.source ? ` – ${h.source}` : ""}` : h.title;
-
+      const title = getIncidentHeadingText(h);
       L.marker([h.lat, h.lng], { icon: makeIncidentIcon(title, h.solved), interactive: true, zIndexOffset: 2200 })
         .bindPopup(`<b>${title}</b><br/>Status: ${h.solved ? "Løst" : "Aktiv"}`)
         .addTo(incidentLayerRef.current);
     });
-  }, [incidents]);
+  }, [incidents, incidentAddressMap, resourceStates]);
 
   // ===== Shared movement animator loop =====
   useEffect(() => {
@@ -726,7 +812,10 @@ export default function App() {
       const toLng = st.dest_lng;
 
       if (fromLat == null || fromLng == null || toLat == null || toLng == null) {
-        const line = [[fromLat ?? DEFAULT_CENTER[0], fromLng ?? DEFAULT_CENTER[1]], [toLat ?? DEFAULT_CENTER[0], toLng ?? DEFAULT_CENTER[1]]];
+        const line = [
+          [fromLat ?? DEFAULT_CENTER[0], fromLng ?? DEFAULT_CENTER[1]],
+          [toLat ?? DEFAULT_CENTER[0], toLng ?? DEFAULT_CENTER[1]],
+        ];
         const cum = buildDistances(line);
         const total = cum[cum.length - 1];
         routeCacheRef.current.set(key, { line, cum, total, fallback: true });
@@ -797,7 +886,7 @@ export default function App() {
 
       const nowMs = Date.now();
       const moving = resourceStates.filter(
-        x => x.status === "MOVING" && x.dest_lat != null && x.dest_lng != null && x.move_started_at
+        (x) => x.status === "MOVING" && x.dest_lat != null && x.dest_lng != null && x.move_started_at
       );
 
       for (const st of moving) {
@@ -840,9 +929,9 @@ export default function App() {
   const returnToStation = async (resourceId) => {
     if (!sessionId) return;
 
-    const current = resourceStates.find(x => x.resource_id === resourceId);
-    const master = resourcesMaster.find(x => x.id === resourceId);
-    const station = stations.find(s => s.id === master?.stationId);
+    const current = resourceStates.find((x) => x.resource_id === resourceId);
+    const master = resourcesMaster.find((x) => x.id === resourceId);
+    const station = stations.find((s) => s.id === master?.stationId);
     const marker = resourceMarkersRef.current.get(resourceId);
 
     if (!station) return;
@@ -959,6 +1048,11 @@ export default function App() {
       return;
     }
 
+    setIncidentAddressMap((prev) => ({
+      ...prev,
+      [`tmp-${Date.now()}`]: "",
+    }));
+
     zoomTo(hit.lat, hit.lng, 13);
   };
 
@@ -973,7 +1067,9 @@ export default function App() {
     try {
       const cleaned = await geocodeAddress(query, 10);
       setResults(cleaned || []);
-      if (!cleaned || cleaned.length === 0) setSearchError("Fant ingen treff. Prøv mer presist (gate + nummer + kommune).");
+      if (!cleaned || cleaned.length === 0) {
+        setSearchError("Fant ingen treff. Prøv mer presist (gate + nummer + kommune).");
+      }
     } catch {
       setSearchError("Søk feilet (nett/proxy eller rate limit).");
     } finally {
@@ -987,8 +1083,11 @@ export default function App() {
     if (searchLayerRef.current) {
       searchLayerRef.current.clearLayers();
       L.circleMarker([r.lat, r.lon], {
-        radius: 8, weight: 2,
-        color: C.accent, fillColor: C.accent, fillOpacity: 0.2,
+        radius: 8,
+        weight: 2,
+        color: C.accent,
+        fillColor: C.accent,
+        fillOpacity: 0.2,
       }).addTo(searchLayerRef.current);
     }
   };
@@ -1068,24 +1167,31 @@ export default function App() {
     }}>
       {/* LEFT */}
       <div style={panelStyle}>
-        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", gap:8 }}>
-          <div style={{ fontWeight:900, fontSize:16 }}>Brannressurser</div>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+          <div style={{ fontWeight: 900, fontSize: 16 }}>Brannressurser</div>
         </div>
 
         <div style={{ marginTop: 8, fontSize: 12, color: C.muted }}>
           {statusMsg} • Del lenken med andre for samme økt.
         </div>
 
-        <div style={{ marginTop: 12, display:"flex", flexDirection:"column", gap:12 }}>
+        <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 12 }}>
           {stations.map((s) => {
             const isOpen = !!expandedStations[s.id];
             return (
               <div key={s.id} style={cardStyle}>
                 <button
-                  onClick={() => setExpandedStations(prev => ({ ...prev, [s.id]: !prev[s.id] }))}
+                  onClick={() => setExpandedStations((prev) => ({ ...prev, [s.id]: !prev[s.id] }))}
                   style={{
-                    width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center",
-                    border: "none", background: "transparent", color: C.text, cursor: "pointer", padding: 0,
+                    width: "100%",
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    border: "none",
+                    background: "transparent",
+                    color: C.text,
+                    cursor: "pointer",
+                    padding: 0,
                     fontWeight: 900,
                   }}
                 >
@@ -1094,12 +1200,11 @@ export default function App() {
                 </button>
 
                 {isOpen && (
-                  <div style={{ marginTop: 10, display:"flex", flexDirection:"column", gap:8 }}>
+                  <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 8 }}>
                     {(resourcesByStation[s.id] || []).map((r) => {
                       const state = resourceStates.find((x) => x.resource_id === r.id);
                       const isPlaced = state?.status === "DEPLOYED" || state?.status === "MOVING";
                       const isSelected = selectedResourceId === r.id;
-
                       const ui = getResourceUi(state);
 
                       return (
@@ -1181,13 +1286,19 @@ export default function App() {
         height: "calc(100vh - 24px)",
       }}>
         <div style={{
-          position: "absolute", zIndex: 800, top: 10, left: "50%",
+          position: "absolute",
+          zIndex: 800,
+          top: 10,
+          left: "50%",
           transform: "translateX(-50%)",
           width: "min(900px, calc(100% - 24px))",
         }}>
           <div style={{
-            display: "flex", gap: 8, padding: 10,
-            borderRadius: 14, border: `1px solid ${C.border}`,
+            display: "flex",
+            gap: 8,
+            padding: 10,
+            borderRadius: 14,
+            border: `1px solid ${C.border}`,
             background: "rgba(15,23,42,0.92)",
             boxShadow: "0 10px 28px rgba(0,0,0,0.45)",
             alignItems: "center",
@@ -1202,7 +1313,9 @@ export default function App() {
                 borderRadius: 12,
                 border: `1px solid ${C.border}`,
                 background: "rgba(255,255,255,0.03)",
-                color: C.text, padding: "10px 12px", outline: "none",
+                color: C.text,
+                padding: "10px 12px",
+                outline: "none",
                 minWidth: 180,
               }}
             />
@@ -1216,7 +1329,9 @@ export default function App() {
                 borderRadius: 12,
                 border: `1px solid ${C.border}`,
                 background: "rgba(255,255,255,0.03)",
-                color: C.text, padding: "10px 12px", outline: "none",
+                color: C.text,
+                padding: "10px 12px",
+                outline: "none",
               }}
             />
             <input
@@ -1229,12 +1344,14 @@ export default function App() {
                 borderRadius: 12,
                 border: `1px solid ${C.border}`,
                 background: "rgba(255,255,255,0.03)",
-                color: C.text, padding: "10px 12px", outline: "none",
+                color: C.text,
+                padding: "10px 12px",
+                outline: "none",
               }}
             />
 
             <button
-              onClick={() => { setSelectedResourceId(null); setIncidentMode(v => !v); }}
+              onClick={() => { setSelectedResourceId(null); setIncidentMode((v) => !v); }}
               style={buttonStyle(incidentMode)}
             >
               Ny hendelse
@@ -1245,7 +1362,8 @@ export default function App() {
             </button>
             <button
               onClick={() => {
-                setResults([]); setSearchError("");
+                setResults([]);
+                setSearchError("");
                 if (searchLayerRef.current) searchLayerRef.current.clearLayers();
               }}
               style={buttonStyle(false)}
@@ -1263,10 +1381,13 @@ export default function App() {
                   key={idx}
                   onClick={() => pickResult(r)}
                   style={{
-                    width: "100%", textAlign: "left",
+                    width: "100%",
+                    textAlign: "left",
                     padding: "10px 12px",
-                    border: "none", background: "transparent",
-                    color: C.text, cursor: "pointer",
+                    border: "none",
+                    background: "transparent",
+                    color: C.text,
+                    cursor: "pointer",
                     borderTop: idx === 0 ? "none" : `1px solid ${C.border}`,
                   }}
                 >
@@ -1279,17 +1400,21 @@ export default function App() {
         </div>
 
         <div style={{
-          position: "absolute", zIndex: 700, top: 10, left: 10,
+          position: "absolute",
+          zIndex: 700,
+          top: 10,
+          left: 10,
           padding: "8px 10px",
           background: "rgba(15,23,42,0.92)",
           border: `1px solid ${C.border}`,
           borderRadius: 12,
-          fontSize: 12, color: C.text,
+          fontSize: 12,
+          color: C.text,
         }}>
           {incidentMode
             ? "Hendelsemodus: klikk i kartet"
             : selectedResourceId
-              ? `Klikk i kartet for å sende ${resourcesMaster.find(x=>x.id===selectedResourceId)?.callSign || ""} (viser kjøring for alle)`
+              ? `Klikk i kartet for å sende ${resourcesMaster.find((x) => x.id === selectedResourceId)?.callSign || ""} (viser kjøring for alle)`
               : "Velg ressurs eller trykk “Ny hendelse”"}
         </div>
 
@@ -1299,7 +1424,7 @@ export default function App() {
       {/* RIGHT */}
       <div style={{ ...panelStyle, display: "flex", flexDirection: "column", gap: 12 }}>
         <div style={cardStyle}>
-          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <div style={{ fontWeight: 900 }}>Instruktør</div>
             <button
               style={buttonStyle(isInstructor)}
@@ -1318,7 +1443,7 @@ export default function App() {
           </div>
 
           {isInstructor && (
-            <div style={{ marginTop: 10, display:"flex", flexDirection:"column", gap: 8 }}>
+            <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 8 }}>
               <input
                 value={abaAddress}
                 onChange={(e) => setAbaAddress(e.target.value)}
@@ -1370,15 +1495,15 @@ export default function App() {
             Klikk en hendelse for å åpne/lukke logg.
           </div>
 
-          <div style={{ marginTop: 12, display:"flex", flexDirection:"column", gap:10 }}>
+          <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 10 }}>
             {incidents.length === 0 ? (
               <div style={{ fontSize: 12, color: C.muted }}>Ingen hendelser opprettet.</div>
             ) : (
               incidents.slice().reverse().map((h) => {
                 const isOpen = expandedIncidentId === h.id;
                 const hLogs = logsByIncident.get(h.id) || [];
-                const isABA = (h.title || "").trim().toUpperCase() === "ABA";
-                const headerTitle = isABA ? `ABA${h.source ? ` – ${h.source}` : ""}` : h.title;
+                const headerTitle = getIncidentHeadingText(h);
+                const linkedResources = getResourcesForIncident(h);
 
                 return (
                   <div key={h.id} style={{
@@ -1388,12 +1513,22 @@ export default function App() {
                     overflow: "hidden",
                   }}>
                     <button
-                      onClick={() => { setExpandedIncidentId(prev => (prev === h.id ? null : h.id)); zoomTo(h.lat, h.lng, 13); }}
+                      onClick={() => {
+                        setExpandedIncidentId((prev) => (prev === h.id ? null : h.id));
+                        zoomTo(h.lat, h.lng, 13);
+                      }}
                       style={{
-                        width: "100%", textAlign: "left",
-                        padding: 10, border: "none", background: "transparent",
-                        color: C.text, cursor: "pointer",
-                        display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8,
+                        width: "100%",
+                        textAlign: "left",
+                        padding: 10,
+                        border: "none",
+                        background: "transparent",
+                        color: C.text,
+                        cursor: "pointer",
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        gap: 8,
                       }}
                     >
                       <div>
@@ -1412,7 +1547,7 @@ export default function App() {
 
                     {isOpen && (
                       <div style={{ padding: 10, borderTop: `1px solid ${C.border}` }}>
-                        <div style={{ display:"flex", gap:8, flexWrap:"wrap", marginBottom: 10 }}>
+                        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
                           {!h.solved && (
                             <button onClick={() => markIncidentSolved(h.id)} style={buttonStyle(false)}>
                               Løst
@@ -1424,9 +1559,37 @@ export default function App() {
                         </div>
 
                         <div style={{
-                          maxHeight: 200, overflow: "auto",
+                          marginBottom: 10,
                           border: `1px solid ${C.border}`,
-                          borderRadius: 12, padding: 10,
+                          borderRadius: 12,
+                          padding: 10,
+                          background: "rgba(255,255,255,0.02)",
+                        }}>
+                          <div style={{ fontSize: 12, color: C.muted, fontWeight: 800 }}>
+                            Ressurser til hendelsen
+                          </div>
+
+                          {linkedResources.length === 0 ? (
+                            <div style={{ marginTop: 6, fontSize: 12, color: C.muted }}>
+                              Ingen ressurser på vei eller fremme.
+                            </div>
+                          ) : (
+                            <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 6 }}>
+                              {linkedResources.map((r) => (
+                                <div key={r.resourceId} style={{ fontSize: 13, fontWeight: 800, color: C.text }}>
+                                  {r.callSign} – {r.status}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+
+                        <div style={{
+                          maxHeight: 200,
+                          overflow: "auto",
+                          border: `1px solid ${C.border}`,
+                          borderRadius: 12,
+                          padding: 10,
                           background: "rgba(255,255,255,0.02)",
                         }}>
                           {hLogs.length === 0 ? (
@@ -1443,16 +1606,19 @@ export default function App() {
                           )}
                         </div>
 
-                        <div style={{ display:"flex", gap:8, marginTop: 10 }}>
+                        <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
                           <input
                             value={author}
                             onChange={(e) => setAuthor(e.target.value)}
                             placeholder="Navn (valgfritt)"
                             style={{
-                              width: 160, borderRadius: 12,
+                              width: 160,
+                              borderRadius: 12,
                               border: `1px solid ${C.border}`,
                               background: "rgba(255,255,255,0.03)",
-                              color: C.text, padding: "10px 12px", outline: "none",
+                              color: C.text,
+                              padding: "10px 12px",
+                              outline: "none",
                             }}
                           />
                           <input
@@ -1461,10 +1627,13 @@ export default function App() {
                             onKeyDown={(e) => { if (e.key === "Enter") sendLog(h.id); }}
                             placeholder="Skriv logg…"
                             style={{
-                              flex: 1, borderRadius: 12,
+                              flex: 1,
+                              borderRadius: 12,
                               border: `1px solid ${C.border}`,
                               background: "rgba(255,255,255,0.03)",
-                              color: C.text, padding: "10px 12px", outline: "none",
+                              color: C.text,
+                              padding: "10px 12px",
+                              outline: "none",
                             }}
                           />
                           <button onClick={() => sendLog(h.id)} style={buttonStyle(false)}>Send</button>
