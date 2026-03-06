@@ -258,6 +258,9 @@ export default function App() {
   const routeCacheRef = useRef(new Map());
   const animHandleRef = useRef(null);
 
+  const incidentsRef = useRef([]);
+  const resourceStatesRef = useRef([]);
+
   const [sessionId, setSessionId] = useState(null);
   const [statusMsg, setStatusMsg] = useState("Kobler til økt…");
 
@@ -296,6 +299,8 @@ export default function App() {
 
   useEffect(() => { selectedResourceIdRef.current = selectedResourceId; }, [selectedResourceId]);
   useEffect(() => { incidentModeRef.current = incidentMode; }, [incidentMode]);
+  useEffect(() => { incidentsRef.current = incidents; }, [incidents]);
+  useEffect(() => { resourceStatesRef.current = resourceStates; }, [resourceStates]);
 
   const resourcesByStation = useMemo(() => {
     const grouped = {};
@@ -475,7 +480,7 @@ export default function App() {
     let best = null;
     let bestDist = Infinity;
 
-    for (const incident of incidents) {
+    for (const incident of incidentsRef.current) {
       let d = Infinity;
 
       if (st.status === "MOVING" && st.dest_lat != null && st.dest_lng != null) {
@@ -525,7 +530,7 @@ export default function App() {
   const startResourceMovement = async (rid, toLat, toLng) => {
     if (!sessionId || !rid) return;
 
-    const current = resourceStates.find((x) => x.resource_id === rid);
+    const current = resourceStatesRef.current.find((x) => x.resource_id === rid);
     const master = resourcesMaster.find((x) => x.id === rid);
     const station = stations.find((s) => s.id === master?.stationId);
     const marker = resourceMarkersRef.current.get(rid);
@@ -666,8 +671,9 @@ export default function App() {
     })();
   }, []);
 
+  const seenIncidentIdsRef = useRef(new Set());
   useEffect(() => {
-    const seen = new Set();
+    const seen = seenIncidentIdsRef.current;
     for (const it of incidents) {
       if (!it?.id) continue;
       if (seen.has(it.id)) continue;
@@ -757,7 +763,7 @@ export default function App() {
       let chosenIncident = null;
       let bestDist = Infinity;
 
-      for (const incident of incidents.filter((x) => !x.solved)) {
+      for (const incident of incidentsRef.current.filter((x) => !x.solved)) {
         const d = haversineMeters([e.latlng.lat, e.latlng.lng], [incident.lat, incident.lng]);
         if (d <= INCIDENT_ASSIGN_RADIUS_METERS && d < bestDist) {
           chosenIncident = incident;
@@ -782,7 +788,7 @@ export default function App() {
       map.remove();
       mapRef.current = null;
     };
-  }, [sessionId, incidents, resourceStates]);
+  }, [sessionId]);
 
   // ===== Resource markers =====
   useEffect(() => {
@@ -839,7 +845,6 @@ export default function App() {
 
     incidents.forEach((h) => {
       const title = getIncidentHeadingText(h);
-
       const group = L.layerGroup().addTo(incidentLayerRef.current);
 
       L.circleMarker([h.lat, h.lng], {
