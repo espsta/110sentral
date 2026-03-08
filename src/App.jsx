@@ -11,7 +11,7 @@ const stations = [
   { id: "S1", name: "S1 Ski",         lat: 59.7195,    lng: 10.8350 },
   { id: "S2", name: "S2 Oppegård",    lat: 59.79516,   lng: 10.8235 },
   { id: "S3", name: "S3 Korsegården", lat: 59.6597191, lng: 10.7258981 },
-  { id: "M1", name: "M1 Moss",        lat: 59.4370,    lng: 10.6570 },
+  { id: "M1", name: "M1 Moss",        lat: 59.4425,    lng: 10.6831 },
   { id: "M2", name: "M2 Rygge",       lat: 59.394353,  lng: 10.732076 },
   { id: "M3", name: "M3 Såner",       lat: 59.5305779, lng: 10.7505367 },
 ];
