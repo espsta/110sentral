@@ -52,6 +52,7 @@ const C = {
 
 const ARRIVE_THRESHOLD_METERS = 80;
 const INCIDENT_ASSIGN_RADIUS_METERS = 300;
+const DRAG_START_PX = 6;
 
 function labelBoxHtml(text, tone = "normal") {
   const solved = tone === "solved";
@@ -297,6 +298,8 @@ export default function App() {
 
   const [incidentAddressMap, setIncidentAddressMap] = useState({});
 
+  const [dragState, setDragState] = useState(null);
+
   useEffect(() => { selectedResourceIdRef.current = selectedResourceId; }, [selectedResourceId]);
   useEffect(() => { incidentModeRef.current = incidentMode; }, [incidentMode]);
   useEffect(() => { incidentsRef.current = incidents; }, [incidents]);
@@ -527,6 +530,20 @@ export default function App() {
     return `${baseTitle}${address ? ` – ${address}` : ""}${resourceText}`;
   };
 
+  const findNearestIncidentByLatLng = (lat, lng, maxMeters = INCIDENT_ASSIGN_RADIUS_METERS) => {
+    let chosen = null;
+    let bestDist = Infinity;
+
+    for (const incident of incidentsRef.current.filter((x) => !x.solved)) {
+      const d = haversineMeters([lat, lng], [incident.lat, incident.lng]);
+      if (d <= maxMeters && d < bestDist) {
+        chosen = incident;
+        bestDist = d;
+      }
+    }
+    return chosen;
+  };
+
   const startResourceMovement = async (rid, toLat, toLng) => {
     if (!sessionId || !rid) return;
 
@@ -535,10 +552,12 @@ export default function App() {
     const station = stations.find((s) => s.id === master?.stationId);
     const marker = resourceMarkersRef.current.get(rid);
 
+    if (!current) return;
+
     let fromLat = null;
     let fromLng = null;
 
-    if (current?.status === "MOVING") {
+    if (current.status === "MOVING") {
       const pos = await getCurrentMovingPosition(current);
       if (pos) {
         fromLat = pos[0];
@@ -554,7 +573,7 @@ export default function App() {
       }
     }
 
-    if ((fromLat == null || fromLng == null) && current?.lat != null && current?.lng != null) {
+    if ((fromLat == null || fromLng == null) && current.lat != null && current.lng != null) {
       fromLat = current.lat;
       fromLng = current.lng;
     }
@@ -585,6 +604,23 @@ export default function App() {
     }
 
     setSelectedResourceId(null);
+  };
+
+  const createIncidentAt = async (lat, lng) => {
+    if (!sessionId) return;
+    const title = window.prompt("Overskrift/hendelsestype (f.eks. 'Brann i bolig'):");
+    if (!title || !title.trim()) return;
+
+    await supabase.from("incidents").insert({
+      session_id: sessionId,
+      title: title.trim(),
+      lat,
+      lng,
+      solved: false,
+    });
+
+    zoomTo(lat, lng, 14);
+    setResults([]);
   };
 
   // ===== Session bootstrap + realtime =====
@@ -715,6 +751,62 @@ export default function App() {
     return () => { cancelled = true; };
   }, [incidents, incidentAddressMap]);
 
+  // Drag/Drop handling
+  useEffect(() => {
+    if (!dragState) return;
+
+    const onMove = (e) => {
+      setDragState((prev) => {
+        if (!prev) return prev;
+        const dx = e.clientX - prev.startX;
+        const dy = e.clientY - prev.startY;
+        const active = prev.active || Math.hypot(dx, dy) >= DRAG_START_PX;
+        return {
+          ...prev,
+          x: e.clientX,
+          y: e.clientY,
+          active,
+        };
+      });
+    };
+
+    const onUp = async (e) => {
+      const currentDrag = dragState;
+      setDragState(null);
+
+      if (!currentDrag?.active) return;
+
+      const map = mapRef.current;
+      const mapEl = mapDivRef.current;
+      if (!map || !mapEl) return;
+
+      const rect = mapEl.getBoundingClientRect();
+      const inside =
+        e.clientX >= rect.left &&
+        e.clientX <= rect.right &&
+        e.clientY >= rect.top &&
+        e.clientY <= rect.bottom;
+
+      if (!inside) return;
+
+      const point = L.point(e.clientX - rect.left, e.clientY - rect.top);
+      const latlng = map.containerPointToLatLng(point);
+      const incident = findNearestIncidentByLatLng(latlng.lat, latlng.lng);
+
+      if (incident) {
+        await startResourceMovement(currentDrag.resourceId, incident.lat, incident.lng);
+      }
+    };
+
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [dragState]);
+
   // ===== Map init =====
   useEffect(() => {
     if (!mapDivRef.current) return;
@@ -760,16 +852,7 @@ export default function App() {
       const rid = selectedResourceIdRef.current;
       if (!rid) return;
 
-      let chosenIncident = null;
-      let bestDist = Infinity;
-
-      for (const incident of incidentsRef.current.filter((x) => !x.solved)) {
-        const d = haversineMeters([e.latlng.lat, e.latlng.lng], [incident.lat, incident.lng]);
-        if (d <= INCIDENT_ASSIGN_RADIUS_METERS && d < bestDist) {
-          chosenIncident = incident;
-          bestDist = d;
-        }
-      }
+      const chosenIncident = findNearestIncidentByLatLng(e.latlng.lat, e.latlng.lng);
 
       if (chosenIncident) {
         await startResourceMovement(rid, chosenIncident.lat, chosenIncident.lng);
@@ -953,8 +1036,29 @@ export default function App() {
       );
 
       for (const st of moving) {
-        const marker = resourceMarkersRef.current.get(st.resource_id);
-        if (!marker) continue;
+        let marker = resourceMarkersRef.current.get(st.resource_id);
+
+        if (!marker) {
+          let lat = st.start_lat ?? st.lat;
+          let lng = st.start_lng ?? st.lng;
+
+          if (lat == null || lng == null) {
+            const master = resourcesMaster.find((x) => x.id === st.resource_id);
+            const station = stations.find((s) => s.id === master?.stationId);
+            lat = station?.lat ?? DEFAULT_CENTER[0];
+            lng = station?.lng ?? DEFAULT_CENTER[1];
+          }
+
+          marker = L.marker([lat, lng], {
+            icon: makeFireTruckIcon(st.call_sign),
+            interactive: true,
+            zIndexOffset: 2000,
+          })
+            .bindPopup(`<b>${st.call_sign}</b><br/>${st.type}`)
+            .addTo(resourceLayerRef.current);
+
+          resourceMarkersRef.current.set(st.resource_id, marker);
+        }
 
         const t0 = parseTs(st.move_started_at);
         if (!t0) continue;
@@ -992,17 +1096,17 @@ export default function App() {
   const returnToStation = async (resourceId) => {
     if (!sessionId) return;
 
-    const current = resourceStates.find((x) => x.resource_id === resourceId);
+    const current = resourceStatesRef.current.find((x) => x.resource_id === resourceId);
     const master = resourcesMaster.find((x) => x.id === resourceId);
     const station = stations.find((s) => s.id === master?.stationId);
     const marker = resourceMarkersRef.current.get(resourceId);
 
-    if (!station) return;
+    if (!station || !current) return;
 
     let fromLat = null;
     let fromLng = null;
 
-    if (current?.status === "MOVING") {
+    if (current.status === "MOVING") {
       const pos = await getCurrentMovingPosition(current);
       if (pos) { fromLat = pos[0]; fromLng = pos[1]; }
     }
@@ -1015,7 +1119,7 @@ export default function App() {
       }
     }
 
-    if ((fromLat == null || fromLng == null) && current?.lat != null && current?.lng != null) {
+    if ((fromLat == null || fromLng == null) && current.lat != null && current.lng != null) {
       fromLat = current.lat;
       fromLng = current.lng;
     }
@@ -1023,6 +1127,21 @@ export default function App() {
     if (fromLat == null || fromLng == null) {
       fromLat = station.lat;
       fromLng = station.lng;
+    }
+
+    // sørg for at marker finnes og står på korrekt startpunkt før retur starter
+    let ensuredMarker = marker;
+    if (!ensuredMarker && resourceLayerRef.current) {
+      ensuredMarker = L.marker([fromLat, fromLng], {
+        icon: makeFireTruckIcon(current.call_sign),
+        interactive: true,
+        zIndexOffset: 2000,
+      })
+        .bindPopup(`<b>${current.call_sign}</b><br/>${current.type}`)
+        .addTo(resourceLayerRef.current);
+      resourceMarkersRef.current.set(resourceId, ensuredMarker);
+    } else if (ensuredMarker) {
+      ensuredMarker.setLatLng([fromLat, fromLng]);
     }
 
     await supabase
@@ -1222,7 +1341,30 @@ export default function App() {
       padding: 12,
       background: C.bg,
       fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
+      position: "relative",
     }}>
+      {dragState?.active && (
+        <div
+          style={{
+            position: "fixed",
+            left: dragState.x + 12,
+            top: dragState.y + 12,
+            zIndex: 5000,
+            pointerEvents: "none",
+            padding: "8px 10px",
+            borderRadius: 12,
+            background: "rgba(15,23,42,0.96)",
+            border: `1px solid ${C.border}`,
+            color: C.text,
+            boxShadow: "0 10px 28px rgba(0,0,0,0.45)",
+            fontWeight: 900,
+            fontSize: 13,
+          }}
+        >
+          {resourcesMaster.find((r) => r.id === dragState.resourceId)?.callSign || "Ressurs"}
+        </div>
+      )}
+
       <div style={panelStyle}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
           <div style={{ fontWeight: 900, fontSize: 16 }}>Brannressurser</div>
@@ -1274,11 +1416,25 @@ export default function App() {
                             borderRadius: 12,
                             background: ui.wrapBg,
                             color: ui.wrapColor,
-                            border: `1px solid ${C.border}`,
+                            border: isSelected
+                              ? "3px solid rgba(255,255,255,0.95)"
+                              : `1px solid ${C.border}`,
+                            boxShadow: isSelected ? "0 0 0 2px rgba(147,197,253,0.35)" : "none",
                             padding: 8,
                           }}
                         >
                           <button
+                            onMouseDown={(e) => {
+                              if (e.button !== 0) return;
+                              setDragState({
+                                resourceId: r.id,
+                                startX: e.clientX,
+                                startY: e.clientY,
+                                x: e.clientX,
+                                y: e.clientY,
+                                active: false,
+                              });
+                            }}
                             onClick={() => {
                               setIncidentMode(false);
                               setSelectedResourceId(isSelected ? null : r.id);
@@ -1347,7 +1503,7 @@ export default function App() {
           top: 10,
           left: "50%",
           transform: "translateX(-50%)",
-          width: "min(900px, calc(100% - 24px))",
+          width: "min(980px, calc(100% - 24px))",
         }}>
           <div style={{
             display: "flex",
@@ -1433,23 +1589,39 @@ export default function App() {
           {results.length > 0 && (
             <div style={{ marginTop: 8, borderRadius: 14, border: `1px solid ${C.border}`, background: "rgba(15,23,42,0.96)", overflow: "hidden" }}>
               {results.map((r, idx) => (
-                <button
+                <div
                   key={idx}
-                  onClick={() => pickResult(r)}
                   style={{
-                    width: "100%",
-                    textAlign: "left",
+                    display: "grid",
+                    gridTemplateColumns: "1fr auto",
+                    gap: 8,
                     padding: "10px 12px",
-                    border: "none",
-                    background: "transparent",
-                    color: C.text,
-                    cursor: "pointer",
                     borderTop: idx === 0 ? "none" : `1px solid ${C.border}`,
+                    alignItems: "center",
                   }}
                 >
-                  <div style={{ fontWeight: 800, fontSize: 12, color: C.muted }}>Treff</div>
-                  <div style={{ fontWeight: 800 }}>{r.display_name}</div>
-                </button>
+                  <button
+                    onClick={() => pickResult(r)}
+                    style={{
+                      textAlign: "left",
+                      border: "none",
+                      background: "transparent",
+                      color: C.text,
+                      cursor: "pointer",
+                      padding: 0,
+                    }}
+                  >
+                    <div style={{ fontWeight: 800, fontSize: 12, color: C.muted }}>Treff</div>
+                    <div style={{ fontWeight: 800 }}>{r.display_name}</div>
+                  </button>
+
+                  <button
+                    onClick={() => createIncidentAt(r.lat, r.lon)}
+                    style={buttonStyle(false)}
+                  >
+                    Opprett hendelse
+                  </button>
+                </div>
               ))}
             </div>
           )}
@@ -1470,7 +1642,7 @@ export default function App() {
           {incidentMode
             ? "Hendelsemodus: klikk i kartet"
             : selectedResourceId
-              ? `Klikk i kartet for å sende ${resourcesMaster.find((x) => x.id === selectedResourceId)?.callSign || ""} (viser kjøring for alle)`
+              ? `Klikk i kartet eller dra ${resourcesMaster.find((x) => x.id === selectedResourceId)?.callSign || ""} til en hendelse`
               : "Velg ressurs eller trykk “Ny hendelse”"}
         </div>
 
