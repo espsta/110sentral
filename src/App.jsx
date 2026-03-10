@@ -69,7 +69,7 @@ function labelBoxHtml(text, tone = "normal") {
       box-shadow:0 1px 6px rgba(0,0,0,0.25);
       margin-bottom:4px;
       white-space:nowrap;
-      max-width: 320px;
+      max-width:320px;
       overflow:hidden;
       text-overflow:ellipsis;
     ">${text}</div>
@@ -124,11 +124,13 @@ function getSessionCodeFromUrl() {
   const url = new URL(window.location.href);
   return url.searchParams.get("session");
 }
+
 function setSessionCodeInUrl(code) {
   const url = new URL(window.location.href);
   url.searchParams.set("session", code);
   window.history.replaceState({}, "", url.toString());
 }
+
 function makeCode(len = 6) {
   const chars = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
   let out = "";
@@ -146,14 +148,17 @@ function upsertById(prev, payload) {
   next[idx] = row;
   return next;
 }
+
 function upsertByKey(prev, payload, keys) {
   const row = payload.new || payload.old;
   if (!row) return prev;
   const keyOf = (obj) => keys.map((k) => obj[k]).join("||");
+
   if (payload.eventType === "DELETE") {
     const k = keyOf(row);
     return prev.filter((x) => keyOf(x) !== k);
   }
+
   const k = keyOf(row);
   const idx = prev.findIndex((x) => keyOf(x) === k);
   if (idx === -1) return [...prev, row];
@@ -235,9 +240,11 @@ function interpolateOnLine(points, cumDist, dist) {
 
   let i = 1;
   while (i < cumDist.length && cumDist[i] < dist) i++;
-  const d0 = cumDist[i - 1], d1 = cumDist[i];
+  const d0 = cumDist[i - 1];
+  const d1 = cumDist[i];
   const t = (dist - d0) / (d1 - d0);
-  const p0 = points[i - 1], p1 = points[i];
+  const p0 = points[i - 1];
+  const p1 = points[i];
   return [p0[0] + (p1[0] - p0[0]) * t, p0[1] + (p1[1] - p0[1]) * t];
 }
 
@@ -257,6 +264,7 @@ export default function App() {
 
   const resourceMarkersRef = useRef(new Map());
   const routeCacheRef = useRef(new Map());
+  const pendingRouteFetchesRef = useRef(new Map());
   const animHandleRef = useRef(null);
 
   const incidentsRef = useRef([]);
@@ -308,7 +316,9 @@ export default function App() {
     const grouped = {};
     for (const s of stations) grouped[s.id] = [];
     for (const r of resourcesMaster) grouped[r.stationId].push(r);
-    for (const k of Object.keys(grouped)) grouped[k].sort((a, b) => a.callSign.localeCompare(b.callSign, "no"));
+    for (const k of Object.keys(grouped)) {
+      grouped[k].sort((a, b) => a.callSign.localeCompare(b.callSign, "no"));
+    }
     return grouped;
   }, []);
 
@@ -337,12 +347,14 @@ export default function App() {
     border: `1px solid ${C.border}`,
     color: C.text,
   };
+
   const cardStyle = {
     border: `1px solid ${C.border}`,
     borderRadius: 12,
     padding: 10,
     background: C.card,
   };
+
   const buttonStyle = (active = false) => ({
     border: `1px solid ${C.border}`,
     background: active ? "rgba(147,197,253,0.12)" : C.card,
@@ -371,10 +383,7 @@ export default function App() {
   };
 
   const geocodeAddress = async (rawOrParts, limit = 1) => {
-    const raw = typeof rawOrParts === "string"
-      ? rawOrParts
-      : buildAddressQuery(rawOrParts);
-
+    const raw = typeof rawOrParts === "string" ? rawOrParts : buildAddressQuery(rawOrParts);
     const q0 = (raw || "").trim();
     if (!q0) return null;
 
@@ -385,7 +394,9 @@ export default function App() {
       "&viewbox=" + encodeURIComponent(viewbox) +
       "&bounded=1&q=" + encodeURIComponent(q0);
 
-    const res = await fetch(url, { headers: { Accept: "application/json", "Accept-Language": "no" } });
+    const res = await fetch(url, {
+      headers: { Accept: "application/json", "Accept-Language": "no" },
+    });
     if (!res.ok) throw new Error("Nominatim failed");
     const data = await res.json();
 
@@ -430,20 +441,41 @@ export default function App() {
   const ensureRouteCached = async (resourceId, moveStartedAt, fromLat, fromLng, toLat, toLng) => {
     const key = `${resourceId}::${moveStartedAt}::${toLat},${toLng}`;
     if (routeCacheRef.current.has(key)) return key;
+    if (pendingRouteFetchesRef.current.has(key)) return key;
 
-    try {
-      const line = await fetchRouteOSRM(fromLat, fromLng, toLat, toLng);
-      const cum = buildDistances(line);
-      const total = cum[cum.length - 1];
-      routeCacheRef.current.set(key, { line, cum, total, fallback: false });
-    } catch {
-      const line = [[fromLat, fromLng], [toLat, toLng]];
-      const cum = buildDistances(line);
-      const total = cum[cum.length - 1];
-      routeCacheRef.current.set(key, { line, cum, total, fallback: true });
-    }
+    const p = (async () => {
+      try {
+        const line = await fetchRouteOSRM(fromLat, fromLng, toLat, toLng);
+        const cum = buildDistances(line);
+        const total = cum[cum.length - 1];
+        routeCacheRef.current.set(key, { line, cum, total, fallback: false });
+      } catch {
+        const line = [[fromLat, fromLng], [toLat, toLng]];
+        const cum = buildDistances(line);
+        const total = cum[cum.length - 1];
+        routeCacheRef.current.set(key, { line, cum, total, fallback: true });
+      } finally {
+        pendingRouteFetchesRef.current.delete(key);
+      }
+    })();
 
+    pendingRouteFetchesRef.current.set(key, p);
     return key;
+  };
+
+  const getRouteSnapshotForState = (st) => {
+    const key = `${st.resource_id}::${st.move_started_at}::${st.dest_lat},${st.dest_lng}`;
+    const cached = routeCacheRef.current.get(key);
+    if (cached) return cached;
+
+    const fromLat = st.start_lat ?? st.lat ?? DEFAULT_CENTER[0];
+    const fromLng = st.start_lng ?? st.lng ?? DEFAULT_CENTER[1];
+    const toLat = st.dest_lat ?? DEFAULT_CENTER[0];
+    const toLng = st.dest_lng ?? DEFAULT_CENTER[1];
+    const line = [[fromLat, fromLng], [toLat, toLng]];
+    const cum = buildDistances(line);
+    const total = cum[cum.length - 1];
+    return { line, cum, total, fallback: true };
   };
 
   const getCurrentMovingPosition = async (st) => {
@@ -455,33 +487,8 @@ export default function App() {
     const elapsedSec = Math.max(0, (nowMs - t0) / 1000);
     const dist = elapsedSec * speed;
 
-    const fromLat = st.start_lat ?? st.lat;
-    const fromLng = st.start_lng ?? st.lng;
-    const toLat = st.dest_lat;
-    const toLng = st.dest_lng;
-
-    if (fromLat == null || fromLng == null || toLat == null || toLng == null) return null;
-
-    const key = `${st.resource_id}::${st.move_started_at}::${toLat},${toLng}`;
-    let cached = routeCacheRef.current.get(key);
-
-    if (!cached) {
-      try {
-        const line = await fetchRouteOSRM(fromLat, fromLng, toLat, toLng);
-        const cum = buildDistances(line);
-        const total = cum[cum.length - 1];
-        cached = { line, cum, total, fallback: false };
-        routeCacheRef.current.set(key, cached);
-      } catch {
-        const line = [[fromLat, fromLng], [toLat, toLng]];
-        const cum = buildDistances(line);
-        const total = cum[cum.length - 1];
-        cached = { line, cum, total, fallback: true };
-        routeCacheRef.current.set(key, cached);
-      }
-    }
-
-    return interpolateOnLine(cached.line, cached.cum, dist);
+    const route = getRouteSnapshotForState(st);
+    return interpolateOnLine(route.line, route.cum, dist);
   };
 
   const isReturnToStationMove = (st) => {
@@ -538,13 +545,9 @@ export default function App() {
   const getIncidentHeadingText = (incident) => {
     const isABA = (incident.title || "").trim().toUpperCase() === "ABA";
     const baseTitle = isABA ? `ABA${incident.source ? ` – ${incident.source}` : ""}` : incident.title;
-
     const address = incidentAddressMap[incident.id]?.trim();
     const resources = getResourcesForIncident(incident);
-    const resourceText = resources.length > 0
-      ? ` • ${resources.map((r) => r.callSign).join(", ")}`
-      : "";
-
+    const resourceText = resources.length > 0 ? ` • ${resources.map((r) => r.callSign).join(", ")}` : "";
     return `${baseTitle}${address ? ` – ${address}` : ""}${resourceText}`;
   };
 
@@ -620,17 +623,21 @@ export default function App() {
 
     ensureRouteCached(rid, moveStartedAt, fromLat, fromLng, toLat, toLng);
 
-    const { error } = await supabase.from("resource_states").update({
-      status: "MOVING",
-      start_lat: fromLat,
-      start_lng: fromLng,
-      dest_lat: toLat,
-      dest_lng: toLng,
-      move_started_at: moveStartedAt,
-      speed_mps: speedMps,
-      lat: fromLat,
-      lng: fromLng,
-    }).eq("session_id", sessionId).eq("resource_id", rid);
+    const { error } = await supabase
+      .from("resource_states")
+      .update({
+        status: "MOVING",
+        start_lat: fromLat,
+        start_lng: fromLng,
+        dest_lat: toLat,
+        dest_lng: toLng,
+        move_started_at: moveStartedAt,
+        speed_mps: speedMps,
+        lat: fromLat,
+        lng: fromLng,
+      })
+      .eq("session_id", sessionId)
+      .eq("resource_id", rid);
 
     if (error) {
       console.error("Start movement failed:", error);
@@ -658,7 +665,6 @@ export default function App() {
     setResults([]);
   };
 
-  // ===== Session bootstrap + realtime =====
   useEffect(() => {
     (async () => {
       let code = getSessionCodeFromUrl();
@@ -675,7 +681,10 @@ export default function App() {
         .eq("code", code)
         .maybeSingle();
 
-      if (e1) { setStatusMsg("Feil ved oppslag av økt."); return; }
+      if (e1) {
+        setStatusMsg("Feil ved oppslag av økt.");
+        return;
+      }
 
       let sid = existing?.id;
       if (!sid) {
@@ -684,7 +693,11 @@ export default function App() {
           .insert({ code })
           .select("id, code")
           .single();
-        if (e2) { setStatusMsg("Feil ved opprettelse av økt."); return; }
+
+        if (e2) {
+          setStatusMsg("Feil ved opprettelse av økt.");
+          return;
+        }
         sid = created.id;
       }
 
@@ -707,6 +720,7 @@ export default function App() {
         move_started_at: null,
         speed_mps: null,
       }));
+
       await supabase.from("resource_states").upsert(seed, { onConflict: "session_id,resource_id" });
 
       const [rs, inc, lg] = await Promise.all([
@@ -726,11 +740,13 @@ export default function App() {
         { event: "*", schema: "public", table: "resource_states", filter: `session_id=eq.${sid}` },
         (payload) => setResourceStates((prev) => upsertByKey(prev, payload, ["session_id", "resource_id"]))
       );
+
       ch.on(
         "postgres_changes",
         { event: "*", schema: "public", table: "incidents", filter: `session_id=eq.${sid}` },
         (payload) => setIncidents((prev) => upsertById(prev, payload))
       );
+
       ch.on(
         "postgres_changes",
         { event: "*", schema: "public", table: "incident_logs", filter: `session_id=eq.${sid}` },
@@ -769,16 +785,10 @@ export default function App() {
         try {
           const addr = await reverseGeocode(h.lat, h.lng);
           if (cancelled) return;
-          setIncidentAddressMap((prev) => ({
-            ...prev,
-            [h.id]: addr || "",
-          }));
+          setIncidentAddressMap((prev) => ({ ...prev, [h.id]: addr || "" }));
         } catch {
           if (cancelled) return;
-          setIncidentAddressMap((prev) => ({
-            ...prev,
-            [h.id]: "",
-          }));
+          setIncidentAddressMap((prev) => ({ ...prev, [h.id]: "" }));
         }
       }
     })();
@@ -795,12 +805,7 @@ export default function App() {
         const dx = e.clientX - prev.startX;
         const dy = e.clientY - prev.startY;
         const active = prev.active || Math.hypot(dx, dy) >= DRAG_START_PX;
-        return {
-          ...prev,
-          x: e.clientX,
-          y: e.clientY,
-          active,
-        };
+        return { ...prev, x: e.clientX, y: e.clientY, active };
       });
     };
 
@@ -841,7 +846,6 @@ export default function App() {
     };
   }, [dragState]);
 
-  // ===== Map init =====
   useEffect(() => {
     if (!mapDivRef.current) return;
     if (mapRef.current) return;
@@ -859,7 +863,11 @@ export default function App() {
     searchLayerRef.current = L.layerGroup().addTo(map);
 
     stations.forEach((s) => {
-      L.marker([s.lat, s.lng], { icon: makeStationIcon(s.id), interactive: true, zIndexOffset: 2600 })
+      L.marker([s.lat, s.lng], {
+        icon: makeStationIcon(s.id),
+        interactive: true,
+        zIndexOffset: 2600,
+      })
         .bindPopup(`<b>${s.name}</b>`)
         .addTo(stationLayerRef.current);
     });
@@ -907,7 +915,6 @@ export default function App() {
     };
   }, [sessionId]);
 
-  // ===== Resource markers =====
   useEffect(() => {
     if (!resourceLayerRef.current) return;
 
@@ -943,19 +950,21 @@ export default function App() {
 
       const existing = mapMarkers.get(st.resource_id);
       if (!existing) {
-        const m = L.marker([lat, lng], { icon: makeFireTruckIcon(st.call_sign), interactive: true, zIndexOffset: 2000 })
+        const m = L.marker([lat, lng], {
+          icon: makeFireTruckIcon(st.call_sign),
+          interactive: true,
+          zIndexOffset: 2000,
+        })
           .bindPopup(`<b>${st.call_sign}</b><br/>${st.type}`)
           .addTo(layer);
+
         mapMarkers.set(st.resource_id, m);
-      } else {
-        if (st.status === "DEPLOYED" && st.lat != null && st.lng != null) {
-          existing.setLatLng([st.lat, st.lng]);
-        }
+      } else if (st.status === "DEPLOYED" && st.lat != null && st.lng != null) {
+        existing.setLatLng([st.lat, st.lng]);
       }
     }
   }, [resourceStates]);
 
-  // ===== Incidents layer =====
   useEffect(() => {
     if (!incidentLayerRef.current) return;
     incidentLayerRef.current.clearLayers();
@@ -972,53 +981,21 @@ export default function App() {
         interactive: true,
       }).addTo(group);
 
-      L.marker([h.lat, h.lng], { icon: makeIncidentIcon(title, h.solved), interactive: true, zIndexOffset: 2200 })
+      L.marker([h.lat, h.lng], {
+        icon: makeIncidentIcon(title, h.solved),
+        interactive: true,
+        zIndexOffset: 2200,
+      })
         .bindPopup(`<b>${title}</b><br/>Status: ${h.solved ? "Løst" : "Aktiv"}`)
         .addTo(group);
     });
   }, [incidents, incidentAddressMap, resourceStates]);
 
-  // ===== Shared movement animator loop =====
   useEffect(() => {
     let cancelled = false;
 
-    async function ensureRouteForState(st) {
-      const key = `${st.resource_id}::${st.move_started_at}::${st.dest_lat},${st.dest_lng}`;
-      if (routeCacheRef.current.has(key)) return { key, ...routeCacheRef.current.get(key) };
-
-      const fromLat = st.start_lat ?? st.lat;
-      const fromLng = st.start_lng ?? st.lng;
-      const toLat = st.dest_lat;
-      const toLng = st.dest_lng;
-
-      if (fromLat == null || fromLng == null || toLat == null || toLng == null) {
-        const line = [
-          [fromLat ?? DEFAULT_CENTER[0], fromLng ?? DEFAULT_CENTER[1]],
-          [toLat ?? DEFAULT_CENTER[0], toLng ?? DEFAULT_CENTER[1]],
-        ];
-        const cum = buildDistances(line);
-        const total = cum[cum.length - 1];
-        routeCacheRef.current.set(key, { line, cum, total, fallback: true });
-        return { key, line, cum, total, fallback: true };
-      }
-
-      try {
-        const line = await fetchRouteOSRM(fromLat, fromLng, toLat, toLng);
-        const cum = buildDistances(line);
-        const total = cum[cum.length - 1];
-        routeCacheRef.current.set(key, { line, cum, total, fallback: false });
-        return { key, line, cum, total, fallback: false };
-      } catch {
-        const line = [[fromLat, fromLng], [toLat, toLng]];
-        const cum = buildDistances(line);
-        const total = cum[cum.length - 1];
-        routeCacheRef.current.set(key, { line, cum, total, fallback: true });
-        return { key, line, cum, total, fallback: true };
-      }
-    }
-
-    async function finalizeAsDeployed(st) {
-      const { error } = await supabase
+    function finalizeAsDeployed(st) {
+      supabase
         .from("resource_states")
         .update({
           status: "DEPLOYED",
@@ -1034,13 +1011,14 @@ export default function App() {
         .eq("session_id", st.session_id)
         .eq("resource_id", st.resource_id)
         .eq("status", "MOVING")
-        .eq("move_started_at", st.move_started_at);
-
-      if (error) console.warn("Finalize deployed failed:", error);
+        .eq("move_started_at", st.move_started_at)
+        .then(({ error }) => {
+          if (error) console.warn("Finalize deployed failed:", error);
+        });
     }
 
-    async function finalizeAsOnStation(st) {
-      const { error } = await supabase
+    function finalizeAsOnStation(st) {
+      supabase
         .from("resource_states")
         .update({
           status: "ON_STATION",
@@ -1056,79 +1034,83 @@ export default function App() {
         .eq("session_id", st.session_id)
         .eq("resource_id", st.resource_id)
         .eq("status", "MOVING")
-        .eq("move_started_at", st.move_started_at);
-
-      if (error) console.warn("Finalize on-station failed:", error);
+        .eq("move_started_at", st.move_started_at)
+        .then(({ error }) => {
+          if (error) console.warn("Finalize on-station failed:", error);
+        });
     }
 
     async function tick() {
       if (cancelled) return;
 
       const nowMs = Date.now();
-      const moving = resourceStates.filter(
+      const moving = resourceStatesRef.current.filter(
         (x) => x.status === "MOVING" && x.dest_lat != null && x.dest_lng != null && x.move_started_at
       );
 
-      await Promise.all(
-        moving.map(async (st) => {
-          let marker = resourceMarkersRef.current.get(st.resource_id);
+      for (const st of moving) {
+        let marker = resourceMarkersRef.current.get(st.resource_id);
 
-          if (!marker) {
-            let lat = st.start_lat ?? st.lat;
-            let lng = st.start_lng ?? st.lng;
+        if (!marker) {
+          let lat = st.start_lat ?? st.lat;
+          let lng = st.start_lng ?? st.lng;
 
-            if (lat == null || lng == null) {
-              const master = resourcesMaster.find((x) => x.id === st.resource_id);
-              const station = stations.find((s) => s.id === master?.stationId);
-              lat = station?.lat ?? DEFAULT_CENTER[0];
-              lng = station?.lng ?? DEFAULT_CENTER[1];
-            }
-
-            marker = L.marker([lat, lng], {
-              icon: makeFireTruckIcon(st.call_sign),
-              interactive: true,
-              zIndexOffset: 2000,
-            })
-              .bindPopup(`<b>${st.call_sign}</b><br/>${st.type}`)
-              .addTo(resourceLayerRef.current);
-
-            resourceMarkersRef.current.set(st.resource_id, marker);
+          if (lat == null || lng == null) {
+            const master = resourcesMaster.find((x) => x.id === st.resource_id);
+            const station = stations.find((s) => s.id === master?.stationId);
+            lat = station?.lat ?? DEFAULT_CENTER[0];
+            lng = station?.lng ?? DEFAULT_CENTER[1];
           }
 
-          const t0 = parseTs(st.move_started_at);
-          if (!t0) return;
+          marker = L.marker([lat, lng], {
+            icon: makeFireTruckIcon(st.call_sign),
+            interactive: true,
+            zIndexOffset: 2000,
+          })
+            .bindPopup(`<b>${st.call_sign}</b><br/>${st.type}`)
+            .addTo(resourceLayerRef.current);
 
-          const speed = (st.speed_mps && Number(st.speed_mps) > 0) ? Number(st.speed_mps) : 20.0;
-          const elapsedSec = Math.max(0, (nowMs - t0) / 1000);
-          const dist = elapsedSec * speed;
+          resourceMarkersRef.current.set(st.resource_id, marker);
+        }
 
-          const route = await ensureRouteForState(st);
-          if (cancelled) return;
+        const t0 = parseTs(st.move_started_at);
+        if (!t0) continue;
 
-          const total = route.total || 0;
-          const pos = interpolateOnLine(route.line, route.cum, dist);
-          marker.setLatLng(pos);
+        const speed = (st.speed_mps && Number(st.speed_mps) > 0) ? Number(st.speed_mps) : 20.0;
+        const elapsedSec = Math.max(0, (nowMs - t0) / 1000);
+        const dist = elapsedSec * speed;
 
-          if (dist >= Math.max(0, total - ARRIVE_THRESHOLD_METERS)) {
-            marker.setLatLng([st.dest_lat, st.dest_lng]);
-            if (isReturnToStationMove(st)) await finalizeAsOnStation(st);
-            else await finalizeAsDeployed(st);
-          }
-        })
-      );
+        const fromLat = st.start_lat ?? st.lat ?? DEFAULT_CENTER[0];
+        const fromLng = st.start_lng ?? st.lng ?? DEFAULT_CENTER[1];
+        const toLat = st.dest_lat ?? DEFAULT_CENTER[0];
+        const toLng = st.dest_lng ?? DEFAULT_CENTER[1];
+
+        ensureRouteCached(st.resource_id, st.move_started_at, fromLat, fromLng, toLat, toLng);
+
+        const route = getRouteSnapshotForState(st);
+        const total = route.total || 0;
+        const pos = interpolateOnLine(route.line, route.cum, dist);
+        marker.setLatLng(pos);
+
+        if (dist >= Math.max(0, total - ARRIVE_THRESHOLD_METERS)) {
+          marker.setLatLng([st.dest_lat, st.dest_lng]);
+          if (isReturnToStationMove(st)) finalizeAsOnStation(st);
+          else finalizeAsDeployed(st);
+        }
+      }
 
       animHandleRef.current = requestAnimationFrame(tick);
     }
 
     animHandleRef.current = requestAnimationFrame(tick);
+
     return () => {
       cancelled = true;
       if (animHandleRef.current) cancelAnimationFrame(animHandleRef.current);
       animHandleRef.current = null;
     };
-  }, [resourceStates]);
+  }, []);
 
-  // ===== Actions =====
   const returnToStation = async (resourceId) => {
     if (!sessionId) return;
 
@@ -1249,7 +1231,12 @@ export default function App() {
     }
 
     let hit = null;
-    try { hit = await geocodeAddress(addr, 1); } catch { hit = null; }
+    try {
+      hit = await geocodeAddress(addr, 1);
+    } catch {
+      hit = null;
+    }
+
     if (!hit) {
       alert("Fant ikke adressen. Prøv mer presist (gate + nummer + sted).");
       return;
@@ -1277,7 +1264,11 @@ export default function App() {
   };
 
   const runSearch = async () => {
-    const query = buildAddressQuery({ street: addrStreet, number: addrNo, municipality: addrMunicipality });
+    const query = buildAddressQuery({
+      street: addrStreet,
+      number: addrNo,
+      municipality: addrMunicipality,
+    });
     if (!query) return;
 
     setSearching(true);
@@ -1376,16 +1367,18 @@ export default function App() {
   };
 
   return (
-    <div style={{
-      height: "100vh",
-      display: "grid",
-      gridTemplateColumns: "320px 1fr 520px",
-      gap: 12,
-      padding: 12,
-      background: C.bg,
-      fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
-      position: "relative",
-    }}>
+    <div
+      style={{
+        height: "100vh",
+        display: "grid",
+        gridTemplateColumns: "320px 1fr 520px",
+        gap: 12,
+        padding: 12,
+        background: C.bg,
+        fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
+        position: "relative",
+      }}
+    >
       {dragState?.active && (
         <div
           style={{
@@ -1408,6 +1401,7 @@ export default function App() {
         </div>
       )}
 
+      {/* LEFT */}
       <div style={panelStyle}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
           <div style={{ fontWeight: 900, fontSize: 16 }}>Brannressurser</div>
@@ -1459,9 +1453,7 @@ export default function App() {
                             borderRadius: 12,
                             background: ui.wrapBg,
                             color: ui.wrapColor,
-                            border: isSelected
-                              ? "3px solid rgba(255,255,255,0.95)"
-                              : `1px solid ${C.border}`,
+                            border: isSelected ? "3px solid rgba(255,255,255,0.95)" : `1px solid ${C.border}`,
                             boxShadow: isSelected ? "0 0 0 2px rgba(147,197,253,0.35)" : "none",
                             padding: 8,
                           }}
@@ -1531,37 +1523,47 @@ export default function App() {
         </div>
       </div>
 
-      <div style={{
-        background: C.panel,
-        borderRadius: 14,
-        overflow: "hidden",
-        boxShadow: "0 10px 28px rgba(0,0,0,0.45)",
-        border: `1px solid ${C.border}`,
-        position: "relative",
-        height: "calc(100vh - 24px)",
-      }}>
-        <div style={{
-          position: "absolute",
-          zIndex: 800,
-          top: 10,
-          left: "50%",
-          transform: "translateX(-50%)",
-          width: "min(980px, calc(100% - 24px))",
-        }}>
-          <div style={{
-            display: "flex",
-            gap: 8,
-            padding: 10,
-            borderRadius: 14,
-            border: `1px solid ${C.border}`,
-            background: "rgba(15,23,42,0.92)",
-            boxShadow: "0 10px 28px rgba(0,0,0,0.45)",
-            alignItems: "center",
-          }}>
+      {/* CENTER */}
+      <div
+        style={{
+          background: C.panel,
+          borderRadius: 14,
+          overflow: "hidden",
+          boxShadow: "0 10px 28px rgba(0,0,0,0.45)",
+          border: `1px solid ${C.border}`,
+          position: "relative",
+          height: "calc(100vh - 24px)",
+        }}
+      >
+        <div
+          style={{
+            position: "absolute",
+            zIndex: 800,
+            top: 10,
+            left: "50%",
+            transform: "translateX(-50%)",
+            width: "min(980px, calc(100% - 24px))",
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              gap: 8,
+              padding: 10,
+              borderRadius: 14,
+              border: `1px solid ${C.border}`,
+              background: "rgba(15,23,42,0.92)",
+              boxShadow: "0 10px 28px rgba(0,0,0,0.45)",
+              alignItems: "center",
+            }}
+          >
             <input
               value={addrStreet}
               onChange={(e) => setAddrStreet(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") runSearch(); if (e.key === "Escape") setResults([]); }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") runSearch();
+                if (e.key === "Escape") setResults([]);
+              }}
               placeholder="Adresse (gate)"
               style={{
                 flex: 1,
@@ -1577,7 +1579,10 @@ export default function App() {
             <input
               value={addrNo}
               onChange={(e) => setAddrNo(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") runSearch(); if (e.key === "Escape") setResults([]); }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") runSearch();
+                if (e.key === "Escape") setResults([]);
+              }}
               placeholder="Nr"
               style={{
                 width: 90,
@@ -1592,7 +1597,10 @@ export default function App() {
             <input
               value={addrMunicipality}
               onChange={(e) => setAddrMunicipality(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") runSearch(); if (e.key === "Escape") setResults([]); }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") runSearch();
+                if (e.key === "Escape") setResults([]);
+              }}
               placeholder="Kommune"
               style={{
                 width: 200,
@@ -1606,7 +1614,10 @@ export default function App() {
             />
 
             <button
-              onClick={() => { setSelectedResourceId(null); setIncidentMode((v) => !v); }}
+              onClick={() => {
+                setSelectedResourceId(null);
+                setIncidentMode((v) => !v);
+              }}
               style={buttonStyle(incidentMode)}
             >
               Ny hendelse
@@ -1615,6 +1626,7 @@ export default function App() {
             <button onClick={runSearch} style={buttonStyle(false)} disabled={searching}>
               {searching ? "Søker…" : "Søk"}
             </button>
+
             <button
               onClick={() => {
                 setResults([]);
@@ -1630,7 +1642,15 @@ export default function App() {
           {searchError && <div style={{ marginTop: 8, fontSize: 12, color: C.danger }}>{searchError}</div>}
 
           {results.length > 0 && (
-            <div style={{ marginTop: 8, borderRadius: 14, border: `1px solid ${C.border}`, background: "rgba(15,23,42,0.96)", overflow: "hidden" }}>
+            <div
+              style={{
+                marginTop: 8,
+                borderRadius: 14,
+                border: `1px solid ${C.border}`,
+                background: "rgba(15,23,42,0.96)",
+                overflow: "hidden",
+              }}
+            >
               {results.map((r, idx) => (
                 <div
                   key={idx}
@@ -1658,10 +1678,7 @@ export default function App() {
                     <div style={{ fontWeight: 800 }}>{r.display_name}</div>
                   </button>
 
-                  <button
-                    onClick={() => createIncidentAt(r.lat, r.lon)}
-                    style={buttonStyle(false)}
-                  >
+                  <button onClick={() => createIncidentAt(r.lat, r.lon)} style={buttonStyle(false)}>
                     Opprett hendelse
                   </button>
                 </div>
@@ -1670,18 +1687,20 @@ export default function App() {
           )}
         </div>
 
-        <div style={{
-          position: "absolute",
-          zIndex: 700,
-          top: 10,
-          left: 10,
-          padding: "8px 10px",
-          background: "rgba(15,23,42,0.92)",
-          border: `1px solid ${C.border}`,
-          borderRadius: 12,
-          fontSize: 12,
-          color: C.text,
-        }}>
+        <div
+          style={{
+            position: "absolute",
+            zIndex: 700,
+            top: 10,
+            left: 10,
+            padding: "8px 10px",
+            background: "rgba(15,23,42,0.92)",
+            border: `1px solid ${C.border}`,
+            borderRadius: 12,
+            fontSize: 12,
+            color: C.text,
+          }}
+        >
           {incidentMode
             ? "Hendelsemodus: klikk i kartet"
             : selectedResourceId
@@ -1692,6 +1711,7 @@ export default function App() {
         <div ref={mapDivRef} style={{ height: "100%", width: "100%" }} />
       </div>
 
+      {/* RIGHT */}
       <div style={{ ...panelStyle, display: "flex", flexDirection: "column", gap: 12 }}>
         <div style={cardStyle}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -1746,7 +1766,11 @@ export default function App() {
 
               <button
                 onClick={generateABA}
-                style={{ ...buttonStyle(false), opacity: sessionId ? 1 : 0.5, cursor: sessionId ? "pointer" : "not-allowed" }}
+                style={{
+                  ...buttonStyle(false),
+                  opacity: sessionId ? 1 : 0.5,
+                  cursor: sessionId ? "pointer" : "not-allowed",
+                }}
                 disabled={!sessionId}
               >
                 Generer ABA-alarm
@@ -1776,12 +1800,15 @@ export default function App() {
                 const linkedResources = getResourcesForIncident(h);
 
                 return (
-                  <div key={h.id} style={{
-                    border: `1px solid ${C.border}`,
-                    borderRadius: 12,
-                    background: isOpen ? "rgba(147,197,253,0.10)" : "rgba(255,255,255,0.03)",
-                    overflow: "hidden",
-                  }}>
+                  <div
+                    key={h.id}
+                    style={{
+                      border: `1px solid ${C.border}`,
+                      borderRadius: 12,
+                      background: isOpen ? "rgba(147,197,253,0.10)" : "rgba(255,255,255,0.03)",
+                      overflow: "hidden",
+                    }}
+                  >
                     <button
                       onClick={() => {
                         setExpandedIncidentId((prev) => (prev === h.id ? null : h.id));
@@ -1828,13 +1855,15 @@ export default function App() {
                           </button>
                         </div>
 
-                        <div style={{
-                          marginBottom: 10,
-                          border: `1px solid ${C.border}`,
-                          borderRadius: 12,
-                          padding: 10,
-                          background: "rgba(255,255,255,0.02)",
-                        }}>
+                        <div
+                          style={{
+                            marginBottom: 10,
+                            border: `1px solid ${C.border}`,
+                            borderRadius: 12,
+                            padding: 10,
+                            background: "rgba(255,255,255,0.02)",
+                          }}
+                        >
                           <div style={{ fontSize: 12, color: C.muted, fontWeight: 800 }}>
                             Ressurser til hendelsen
                           </div>
@@ -1854,21 +1883,24 @@ export default function App() {
                           )}
                         </div>
 
-                        <div style={{
-                          maxHeight: 200,
-                          overflow: "auto",
-                          border: `1px solid ${C.border}`,
-                          borderRadius: 12,
-                          padding: 10,
-                          background: "rgba(255,255,255,0.02)",
-                        }}>
+                        <div
+                          style={{
+                            maxHeight: 200,
+                            overflow: "auto",
+                            border: `1px solid ${C.border}`,
+                            borderRadius: 12,
+                            padding: 10,
+                            background: "rgba(255,255,255,0.02)",
+                          }}
+                        >
                           {hLogs.length === 0 ? (
                             <div style={{ fontSize: 12, color: C.muted }}>Ingen logginnslag.</div>
                           ) : (
                             hLogs.map((l) => (
                               <div key={l.id} style={{ marginBottom: 10 }}>
                                 <div style={{ fontSize: 12, color: C.muted }}>
-                                  {(l.author ? `<${l.author}> ` : "")}{new Date(l.created_at).toLocaleString("no-NO")}
+                                  {(l.author ? `<${l.author}> ` : "")}
+                                  {new Date(l.created_at).toLocaleString("no-NO")}
                                 </div>
                                 <div style={{ color: C.text, fontWeight: 700 }}>{l.message}</div>
                               </div>
@@ -1906,7 +1938,9 @@ export default function App() {
                               outline: "none",
                             }}
                           />
-                          <button onClick={() => sendLog(h.id)} style={buttonStyle(false)}>Send</button>
+                          <button onClick={() => sendLog(h.id)} style={buttonStyle(false)}>
+                            Send
+                          </button>
                         </div>
                       </div>
                     )}
@@ -1917,12 +1951,14 @@ export default function App() {
           </div>
         </div>
 
-        <div style={{
-          borderRadius: 14,
-          border: `1px solid ${C.alarmBorder}`,
-          background: C.alarmBg,
-          padding: 10,
-        }}>
+        <div
+          style={{
+            borderRadius: 14,
+            border: `1px solid ${C.alarmBorder}`,
+            background: C.alarmBg,
+            padding: 10,
+          }}
+        >
           <div style={{ fontWeight: 900, color: "rgba(248,113,113,0.95)" }}>
             ABA-alarmer
           </div>
@@ -1931,13 +1967,16 @@ export default function App() {
               <div style={{ fontSize: 12, color: C.muted }}>Ingen aktive ABA-alarmer.</div>
             ) : (
               abaAlarms.map((a) => (
-                <div key={a.id} style={{
-                  borderRadius: 12,
-                  border: `1px solid rgba(248,113,113,0.30)`,
-                  background: "rgba(220,38,38,0.12)",
-                  padding: 10,
-                  marginBottom: 8,
-                }}>
+                <div
+                  key={a.id}
+                  style={{
+                    borderRadius: 12,
+                    border: `1px solid rgba(248,113,113,0.30)`,
+                    background: "rgba(220,38,38,0.12)",
+                    padding: 10,
+                    marginBottom: 8,
+                  }}
+                >
                   <div style={{ fontWeight: 900, color: "rgba(255,255,255,0.95)" }}>
                     ABA – {a.source || "(ukjent kilde)"}
                   </div>
