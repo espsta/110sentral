@@ -441,53 +441,45 @@ export default function App() {
   const ensureRouteCached = async (resourceId, moveStartedAt, fromLat, fromLng, toLat, toLng) => {
     const key = `${resourceId}::${moveStartedAt}::${toLat},${toLng}`;
     if (routeCacheRef.current.has(key)) return key;
-    if (pendingRouteFetchesRef.current.has(key)) return key;
+    if (pendingRouteFetchesRef.current.has(key)) {
+      await pendingRouteFetchesRef.current.get(key);
+      return key;
+    }
 
     const p = (async () => {
-      try {
-        const line = await fetchRouteOSRM(fromLat, fromLng, toLat, toLng);
-        const cum = buildDistances(line);
-        const total = cum[cum.length - 1];
-        routeCacheRef.current.set(key, { line, cum, total, fallback: false });
-      } catch {
-        const line = [[fromLat, fromLng], [toLat, toLng]];
-        const cum = buildDistances(line);
-        const total = cum[cum.length - 1];
-        routeCacheRef.current.set(key, { line, cum, total, fallback: true });
-      } finally {
+      const line = await fetchRouteOSRM(fromLat, fromLng, toLat, toLng);
+      const cum = buildDistances(line);
+      const total = cum[cum.length - 1];
+      routeCacheRef.current.set(key, { line, cum, total, fallback: false });
+    })()
+      .catch((err) => {
+        console.warn("OSRM route failed:", err);
+      })
+      .finally(() => {
         pendingRouteFetchesRef.current.delete(key);
-      }
-    })();
+      });
 
     pendingRouteFetchesRef.current.set(key, p);
+    await p;
     return key;
   };
 
   const getRouteSnapshotForState = (st) => {
     const key = `${st.resource_id}::${st.move_started_at}::${st.dest_lat},${st.dest_lng}`;
-    const cached = routeCacheRef.current.get(key);
-    if (cached) return cached;
-
-    const fromLat = st.start_lat ?? st.lat ?? DEFAULT_CENTER[0];
-    const fromLng = st.start_lng ?? st.lng ?? DEFAULT_CENTER[1];
-    const toLat = st.dest_lat ?? DEFAULT_CENTER[0];
-    const toLng = st.dest_lng ?? DEFAULT_CENTER[1];
-    const line = [[fromLat, fromLng], [toLat, toLng]];
-    const cum = buildDistances(line);
-    const total = cum[cum.length - 1];
-    return { line, cum, total, fallback: true };
+    return routeCacheRef.current.get(key) || null;
   };
 
   const getCurrentMovingPosition = async (st) => {
     const t0 = parseTs(st.move_started_at);
     if (!t0) return null;
 
+    const route = getRouteSnapshotForState(st);
+    if (!route) return [st.start_lat ?? st.lat, st.start_lng ?? st.lng];
+
     const nowMs = Date.now();
     const speed = (st.speed_mps && Number(st.speed_mps) > 0) ? Number(st.speed_mps) : 20.0;
     const elapsedSec = Math.max(0, (nowMs - t0) / 1000);
     const dist = elapsedSec * speed;
-
-    const route = getRouteSnapshotForState(st);
     return interpolateOnLine(route.line, route.cum, dist);
   };
 
@@ -621,7 +613,7 @@ export default function App() {
     const moveStartedAt = new Date().toISOString();
     const speedMps = 20.0;
 
-    ensureRouteCached(rid, moveStartedAt, fromLat, fromLng, toLat, toLng);
+    await ensureRouteCached(rid, moveStartedAt, fromLat, fromLng, toLat, toLng);
 
     const { error } = await supabase
       .from("resource_states")
@@ -993,8 +985,13 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
+    const finalizedRef = new Set();
 
     function finalizeAsDeployed(st) {
+      const key = `${st.session_id}::${st.resource_id}::${st.move_started_at}::DEPLOYED`;
+      if (finalizedRef.has(key)) return;
+      finalizedRef.add(key);
+
       supabase
         .from("resource_states")
         .update({
@@ -1018,6 +1015,10 @@ export default function App() {
     }
 
     function finalizeAsOnStation(st) {
+      const key = `${st.session_id}::${st.resource_id}::${st.move_started_at}::ON_STATION`;
+      if (finalizedRef.has(key)) return;
+      finalizedRef.add(key);
+
       supabase
         .from("resource_states")
         .update({
@@ -1076,20 +1077,22 @@ export default function App() {
         const t0 = parseTs(st.move_started_at);
         if (!t0) continue;
 
+        const route = getRouteSnapshotForState(st);
+        if (!route) {
+          const holdLat = st.start_lat ?? st.lat;
+          const holdLng = st.start_lng ?? st.lng;
+          if (holdLat != null && holdLng != null) {
+            marker.setLatLng([holdLat, holdLng]);
+          }
+          continue;
+        }
+
         const speed = (st.speed_mps && Number(st.speed_mps) > 0) ? Number(st.speed_mps) : 20.0;
         const elapsedSec = Math.max(0, (nowMs - t0) / 1000);
         const dist = elapsedSec * speed;
-
-        const fromLat = st.start_lat ?? st.lat ?? DEFAULT_CENTER[0];
-        const fromLng = st.start_lng ?? st.lng ?? DEFAULT_CENTER[1];
-        const toLat = st.dest_lat ?? DEFAULT_CENTER[0];
-        const toLng = st.dest_lng ?? DEFAULT_CENTER[1];
-
-        ensureRouteCached(st.resource_id, st.move_started_at, fromLat, fromLng, toLat, toLng);
-
-        const route = getRouteSnapshotForState(st);
         const total = route.total || 0;
         const pos = interpolateOnLine(route.line, route.cum, dist);
+
         marker.setLatLng(pos);
 
         if (dist >= Math.max(0, total - ARRIVE_THRESHOLD_METERS)) {
@@ -1106,6 +1109,7 @@ export default function App() {
 
     return () => {
       cancelled = true;
+      finalizedRef.clear();
       if (animHandleRef.current) cancelAnimationFrame(animHandleRef.current);
       animHandleRef.current = null;
     };
@@ -1167,7 +1171,7 @@ export default function App() {
     const moveStartedAt = new Date().toISOString();
     const speedMps = 20.0;
 
-    ensureRouteCached(resourceId, moveStartedAt, fromLat, fromLng, station.lat, station.lng);
+    await ensureRouteCached(resourceId, moveStartedAt, fromLat, fromLng, station.lat, station.lng);
 
     await supabase
       .from("resource_states")
@@ -1401,7 +1405,6 @@ export default function App() {
         </div>
       )}
 
-      {/* LEFT */}
       <div style={panelStyle}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
           <div style={{ fontWeight: 900, fontSize: 16 }}>Brannressurser</div>
@@ -1523,7 +1526,6 @@ export default function App() {
         </div>
       </div>
 
-      {/* CENTER */}
       <div
         style={{
           background: C.panel,
@@ -1711,7 +1713,6 @@ export default function App() {
         <div ref={mapDivRef} style={{ height: "100%", width: "100%" }} />
       </div>
 
-      {/* RIGHT */}
       <div style={{ ...panelStyle, display: "flex", flexDirection: "column", gap: 12 }}>
         <div style={cardStyle}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
