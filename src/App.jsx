@@ -297,7 +297,6 @@ export default function App() {
   const [searchError, setSearchError] = useState("");
 
   const [incidentAddressMap, setIncidentAddressMap] = useState({});
-
   const [dragState, setDragState] = useState(null);
 
   useEffect(() => { selectedResourceIdRef.current = selectedResourceId; }, [selectedResourceId]);
@@ -428,6 +427,25 @@ export default function App() {
     return parts.join(", ") || data?.display_name || "";
   };
 
+  const ensureRouteCached = async (resourceId, moveStartedAt, fromLat, fromLng, toLat, toLng) => {
+    const key = `${resourceId}::${moveStartedAt}::${toLat},${toLng}`;
+    if (routeCacheRef.current.has(key)) return key;
+
+    try {
+      const line = await fetchRouteOSRM(fromLat, fromLng, toLat, toLng);
+      const cum = buildDistances(line);
+      const total = cum[cum.length - 1];
+      routeCacheRef.current.set(key, { line, cum, total, fallback: false });
+    } catch {
+      const line = [[fromLat, fromLng], [toLat, toLng]];
+      const cum = buildDistances(line);
+      const total = cum[cum.length - 1];
+      routeCacheRef.current.set(key, { line, cum, total, fallback: true });
+    }
+
+    return key;
+  };
+
   const getCurrentMovingPosition = async (st) => {
     const t0 = parseTs(st.move_started_at);
     if (!t0) return null;
@@ -550,7 +568,7 @@ export default function App() {
     const current = resourceStatesRef.current.find((x) => x.resource_id === rid);
     const master = resourcesMaster.find((x) => x.id === rid);
     const station = stations.find((s) => s.id === master?.stationId);
-    const marker = resourceMarkersRef.current.get(rid);
+    let marker = resourceMarkersRef.current.get(rid);
 
     if (!current) return;
 
@@ -583,7 +601,24 @@ export default function App() {
       fromLng = station?.lng ?? DEFAULT_CENTER[1];
     }
 
+    if (!marker && resourceLayerRef.current) {
+      marker = L.marker([fromLat, fromLng], {
+        icon: makeFireTruckIcon(current.call_sign),
+        interactive: true,
+        zIndexOffset: 2000,
+      })
+        .bindPopup(`<b>${current.call_sign}</b><br/>${current.type}`)
+        .addTo(resourceLayerRef.current);
+
+      resourceMarkersRef.current.set(rid, marker);
+    } else if (marker) {
+      marker.setLatLng([fromLat, fromLng]);
+    }
+
+    const moveStartedAt = new Date().toISOString();
     const speedMps = 20.0;
+
+    ensureRouteCached(rid, moveStartedAt, fromLat, fromLng, toLat, toLng);
 
     const { error } = await supabase.from("resource_states").update({
       status: "MOVING",
@@ -591,7 +626,7 @@ export default function App() {
       start_lng: fromLng,
       dest_lat: toLat,
       dest_lng: toLng,
-      move_started_at: new Date().toISOString(),
+      move_started_at: moveStartedAt,
       speed_mps: speedMps,
       lat: fromLat,
       lng: fromLng,
@@ -751,7 +786,6 @@ export default function App() {
     return () => { cancelled = true; };
   }, [incidents, incidentAddressMap]);
 
-  // Drag/Drop handling
   useEffect(() => {
     if (!dragState) return;
 
@@ -1035,51 +1069,53 @@ export default function App() {
         (x) => x.status === "MOVING" && x.dest_lat != null && x.dest_lng != null && x.move_started_at
       );
 
-      for (const st of moving) {
-        let marker = resourceMarkersRef.current.get(st.resource_id);
+      await Promise.all(
+        moving.map(async (st) => {
+          let marker = resourceMarkersRef.current.get(st.resource_id);
 
-        if (!marker) {
-          let lat = st.start_lat ?? st.lat;
-          let lng = st.start_lng ?? st.lng;
+          if (!marker) {
+            let lat = st.start_lat ?? st.lat;
+            let lng = st.start_lng ?? st.lng;
 
-          if (lat == null || lng == null) {
-            const master = resourcesMaster.find((x) => x.id === st.resource_id);
-            const station = stations.find((s) => s.id === master?.stationId);
-            lat = station?.lat ?? DEFAULT_CENTER[0];
-            lng = station?.lng ?? DEFAULT_CENTER[1];
+            if (lat == null || lng == null) {
+              const master = resourcesMaster.find((x) => x.id === st.resource_id);
+              const station = stations.find((s) => s.id === master?.stationId);
+              lat = station?.lat ?? DEFAULT_CENTER[0];
+              lng = station?.lng ?? DEFAULT_CENTER[1];
+            }
+
+            marker = L.marker([lat, lng], {
+              icon: makeFireTruckIcon(st.call_sign),
+              interactive: true,
+              zIndexOffset: 2000,
+            })
+              .bindPopup(`<b>${st.call_sign}</b><br/>${st.type}`)
+              .addTo(resourceLayerRef.current);
+
+            resourceMarkersRef.current.set(st.resource_id, marker);
           }
 
-          marker = L.marker([lat, lng], {
-            icon: makeFireTruckIcon(st.call_sign),
-            interactive: true,
-            zIndexOffset: 2000,
-          })
-            .bindPopup(`<b>${st.call_sign}</b><br/>${st.type}`)
-            .addTo(resourceLayerRef.current);
+          const t0 = parseTs(st.move_started_at);
+          if (!t0) return;
 
-          resourceMarkersRef.current.set(st.resource_id, marker);
-        }
+          const speed = (st.speed_mps && Number(st.speed_mps) > 0) ? Number(st.speed_mps) : 20.0;
+          const elapsedSec = Math.max(0, (nowMs - t0) / 1000);
+          const dist = elapsedSec * speed;
 
-        const t0 = parseTs(st.move_started_at);
-        if (!t0) continue;
+          const route = await ensureRouteForState(st);
+          if (cancelled) return;
 
-        const speed = (st.speed_mps && Number(st.speed_mps) > 0) ? Number(st.speed_mps) : 20.0;
-        const elapsedSec = Math.max(0, (nowMs - t0) / 1000);
-        const dist = elapsedSec * speed;
+          const total = route.total || 0;
+          const pos = interpolateOnLine(route.line, route.cum, dist);
+          marker.setLatLng(pos);
 
-        const route = await ensureRouteForState(st);
-        if (cancelled) return;
-
-        const total = route.total || 0;
-        const pos = interpolateOnLine(route.line, route.cum, dist);
-        marker.setLatLng(pos);
-
-        if (dist >= Math.max(0, total - ARRIVE_THRESHOLD_METERS)) {
-          marker.setLatLng([st.dest_lat, st.dest_lng]);
-          if (isReturnToStationMove(st)) await finalizeAsOnStation(st);
-          else await finalizeAsDeployed(st);
-        }
-      }
+          if (dist >= Math.max(0, total - ARRIVE_THRESHOLD_METERS)) {
+            marker.setLatLng([st.dest_lat, st.dest_lng]);
+            if (isReturnToStationMove(st)) await finalizeAsOnStation(st);
+            else await finalizeAsDeployed(st);
+          }
+        })
+      );
 
       animHandleRef.current = requestAnimationFrame(tick);
     }
@@ -1099,7 +1135,7 @@ export default function App() {
     const current = resourceStatesRef.current.find((x) => x.resource_id === resourceId);
     const master = resourcesMaster.find((x) => x.id === resourceId);
     const station = stations.find((s) => s.id === master?.stationId);
-    const marker = resourceMarkersRef.current.get(resourceId);
+    let marker = resourceMarkersRef.current.get(resourceId);
 
     if (!station || !current) return;
 
@@ -1108,7 +1144,10 @@ export default function App() {
 
     if (current.status === "MOVING") {
       const pos = await getCurrentMovingPosition(current);
-      if (pos) { fromLat = pos[0]; fromLng = pos[1]; }
+      if (pos) {
+        fromLat = pos[0];
+        fromLng = pos[1];
+      }
     }
 
     if (fromLat == null || fromLng == null) {
@@ -1129,20 +1168,24 @@ export default function App() {
       fromLng = station.lng;
     }
 
-    // sørg for at marker finnes og står på korrekt startpunkt før retur starter
-    let ensuredMarker = marker;
-    if (!ensuredMarker && resourceLayerRef.current) {
-      ensuredMarker = L.marker([fromLat, fromLng], {
+    if (!marker && resourceLayerRef.current) {
+      marker = L.marker([fromLat, fromLng], {
         icon: makeFireTruckIcon(current.call_sign),
         interactive: true,
         zIndexOffset: 2000,
       })
         .bindPopup(`<b>${current.call_sign}</b><br/>${current.type}`)
         .addTo(resourceLayerRef.current);
-      resourceMarkersRef.current.set(resourceId, ensuredMarker);
-    } else if (ensuredMarker) {
-      ensuredMarker.setLatLng([fromLat, fromLng]);
+
+      resourceMarkersRef.current.set(resourceId, marker);
+    } else if (marker) {
+      marker.setLatLng([fromLat, fromLng]);
     }
+
+    const moveStartedAt = new Date().toISOString();
+    const speedMps = 20.0;
+
+    ensureRouteCached(resourceId, moveStartedAt, fromLat, fromLng, station.lat, station.lng);
 
     await supabase
       .from("resource_states")
@@ -1152,8 +1195,8 @@ export default function App() {
         start_lng: fromLng,
         dest_lat: station.lat,
         dest_lng: station.lng,
-        move_started_at: new Date().toISOString(),
-        speed_mps: 20.0,
+        move_started_at: moveStartedAt,
+        speed_mps: speedMps,
         lat: fromLat,
         lng: fromLng,
       })
